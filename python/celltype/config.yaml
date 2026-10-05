@@ -1,0 +1,66 @@
+# Cell-type classification pipeline (SPN vs non-SPN, then dSPN vs iSPN).
+# Run from Calcium_2p_preprocessing\python:
+#     python -m celltype.pipeline --config celltype\config.yaml --mode auto
+# Modes: extract | features | label | train | predict | auto
+
+# Session folders (<animal>\<date>\<exptype>_rec<rid>) or paths to the
+# ConcatenatedMovie_MC.tif inside them. Same file names as run_suite2p_on_MC.py.
+inputs:
+  # - 'Y:\mouse1\260930\lintrack_rec001'
+inputs_file: null          # optional .txt with one session folder / movie per line
+
+# Session id = last 3 path parts (animal/date/rec); animal = first of these.
+# Cross-validation leaves one animal out, so this has to be right.
+session_id_depth: 3
+
+# ---------- Suite2p (forwarded to run_suite2p_on_MC.py) ----------
+suite2p:
+  fs: 31.25                 # frame rate of ConcatenatedMovie_MC.tif (Hz)
+  tau: 1.0                 # indicator decay (s): ~0.7 GCaMP6f, ~1.0-1.25 GCaMP6s
+  diameter: 12             # expected soma diameter (px)
+  margin: 0
+  use_mc_bad_frames: true
+  chan2_threshold: 0.65
+  cellpose_chan2: false
+  overwrite: false         # true: rerun Suite2p even if suite2p\plane0\stat.npy exists
+
+# ---------- Imaging / genotype ----------
+um_per_px: 1.0             # SET THIS: size rules are in um
+cre_line: D1               # D1: red+ = dSPN. D2: red+ = iSPN (Drd2-Cre also labels CINs)
+
+# ---------- Features ----------
+feature_version: v1        # bump when features.py changes; caches are per version
+neuropil_coef: 0.7
+baseline_window_s: 60      # rolling-percentile window for F0
+baseline_percentile: 8
+event_z: 3.0               # event threshold in noise SDs
+event_min_dur_s: 0.1
+red_bleedthrough: false    # subtract alpha * green mean from the red image. Only
+                           # meaningful if the red reference was acquired together
+                           # with the green (same frames); leave false for a
+                           # separate structural stack.
+
+# ---------- Labels / models ----------
+label_store: 'C:\path\to\celltype_labels.csv'   # one file shared by all sessions
+model_dir: 'C:\path\to\celltype_model'
+labeler: ''                # your initials, saved with every label
+
+hard_rules:
+  cin_min_diam_um: 20      # larger somata -> non-SPN (cholinergic interneurons)
+  min_solidity: 0.80       # lower -> non-SPN (dendrites, merged ROIs)
+  max_aspect: 2.5          # higher -> non-SPN
+
+model1: selftrain_logreg   # SPN vs non-SPN: selftrain_logreg | selftrain_hgb
+model2: labelspreading     # red+ vs red- among SPNs: labelspreading | logreg
+min_labels_per_class: 20   # fewer non-SPN labels -> stage 1 falls back to an
+                           # anomaly detector fit on SPN labels only
+anomaly_quantile: [0.01, 0.05]   # anomaly mode: non-SPN below 1st, uncertain below 5th
+                                 # percentile of training-SPN scores
+
+thresholds:
+  p_spn_hi: 0.9            # SPN above, non-SPN below p_spn_lo, uncertain in between
+  p_spn_lo: 0.2
+  p_red_hi: 0.9            # red+ above, red- below p_red_lo, ambiguous in between
+  p_red_lo: 0.1
+
+use_iscell: true           # ROIs with Suite2p iscell == 0 are labeled not_cell

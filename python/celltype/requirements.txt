@@ -1,0 +1,12 @@
+# plus suite2p (main branch, as used by run_suite2p_on_MC.py)
+numpy
+scipy
+pandas
+scikit-learn>=1.2
+scikit-image>=0.19
+tifffile
+h5py
+pyyaml
+matplotlib
+joblib
+napari[pyqt5]

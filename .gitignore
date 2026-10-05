@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# MATLAB autosave / backup files
+*.asv
+*.m~
+
+# Editor and OS files
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store

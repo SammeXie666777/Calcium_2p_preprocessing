@@ -91,8 +91,12 @@ clear
 cfg.rootDir   = 'Y:\';
 
 % empty to find all directories
-cfg.mouseList = {'mouse1'};   % {} = search all of rootDir; or e.g. {'ADles2'}
-cfg.dateList  = {'260930'};   % {} = every folder under each mouse (any depth) that directly
+cfg.mouseList = {};   % {} = search all of rootDir; or e.g. {'ADles2'}
+cfg.dateList  = {};   % {} = every folder under each mouse (any depth) that directly
+
+% folders to skip, relative to rootDir: a mouse ('mouse3') or one date/session
+% folder ('mouse1\260930'). Anything below a listed folder is skipped too.
+cfg.excludeList = {};
 
 % folders to add to the path
 cfg.codePaths = {
@@ -159,7 +163,6 @@ if any(ismember(lower(cfg.mcOpts(1:2:end)), lower(reserved)))
 end
 warning('off', 'MATLAB:polyshape:repairedBySimplify')
 
-diary(fullfile(cfg.rootDir, ['batch_2p_Calcium_log_' datestr(now, 'yyyymmdd_HHMMSS') '.txt']))
 fprintf('batch_2p_Calcium started %s\nrootDir: %s\n', datestr(now), cfg.rootDir);
 
 if isempty(gcp('nocreate')), parpool('Threads'); end
@@ -192,7 +195,22 @@ else % recursive search .sbx
         [~, leaf] = cellfun(@fileparts, dateDirs, 'UniformOutput', false);
         dateDirs = dateDirs(ismember(leaf, cfg.dateList));
     end
-    % Save date folders processed for current run
+end
+% drop excluded mouse / date folders
+if ~isempty(cfg.excludeList) && ~isempty(dateDirs)
+    rootNorm = lower(strip(cfg.rootDir, 'right', filesep));
+    rel = lower(strip(erase(lower(dateDirs), rootNorm), 'left', filesep));
+    isExcl = false(size(dateDirs));
+    for e = reshape(lower(strip(cfg.excludeList, 'both', filesep)), 1, [])
+        isExcl = isExcl | strcmp(rel, e{1}) | startsWith(rel, [e{1} filesep]);
+    end
+    if any(isExcl)
+        fprintf('Excluded %d folder(s): %s\n', nnz(isExcl), strjoin(dateDirs(isExcl), ', '));
+    end
+    dateDirs = dateDirs(~isExcl);
+end
+% Save date folders processed for current run
+if ~isempty(dateDirs)
     save(fullfile(cfg.rootDir, 'dirs_w_rec.mat'), 'dateDirs');
 end
 if isempty(dateDirs)
@@ -214,8 +232,8 @@ for d = 1:numel(dateDirs)
 
     [status, recs] = attempt(@() findRecordings(dateDirs{d}, cfg));
     if ~strcmp(status, 'ok')
-        rows = {'-', status};
-        return
+        summary = [summary; {label, dateStr, '-', status}]; %#ok<AGROW>
+        continue
     end
     % Step 0 (optional sbx2tif conversion)
     if cfg.steps.exportTifs
@@ -261,7 +279,6 @@ for i = 1:size(summary, 1)
     fprintf('%-10s %-8s %-22s %s\n', summary{i, :});
 end
 fprintf('batch_2p_Calcium finished %s\n', datestr(now));
-diary off
 
 
 

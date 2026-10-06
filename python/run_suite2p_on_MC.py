@@ -43,8 +43,13 @@ settings["run"], ["detection"], ["io"], ...). Older releases (ops dict) need
 different keys.
 
 Usage:
-    python run_suite2p_on_MC.py <session folder> [<session folder> ...]
+    python run_suite2p_on_MC.py <folder> [<folder> ...]
 or edit SESSIONS below and run without arguments.
+
+Each <folder> is either a session folder (it holds ConcatenatedMovie_MC.tif)
+or a folder above the sessions, e.g. a date folder Y:\\mouse1\\260929 or an
+animal folder Y:\\mouse1: every session found below it (up to SEARCH_DEPTH
+levels down) is processed. Put paths with spaces in quotes.
 """
 import logging
 import os
@@ -65,7 +70,26 @@ from suite2p import default_db, default_settings, run_s2p
 #%%%%%%%%%%%%%%%%
 #%% USER INPUT %%
 #%%%%%%%%%%%%%%%%
-SESSIONS = [r"Y:\mouse1\260929\932_3dir_rec000"]
+# Session folders, or folders above them (date / animal folders are searched
+# for sessions). One per line, each with r"..." and a comma, e.g.
+#     SESSIONS = [
+#         r"Y:\mouse1\260929\932_3dir_rec000",    # one session
+#         r"Y:\mouse1\260930",                    # every session of that date
+#         r"Y:\mouse2",                           # every session of that animal
+#     ]
+SESSIONS = [
+    r"Y:\mouse1\260929\932_3dir_rec000",
+]
+# If SESSIONS is empty (and no folders are given on the command line), every
+# session found under ROOT_DIR is processed.
+ROOT_DIR = "Y:\\"
+# Folders to skip, relative to ROOT_DIR: an animal ("mouse3"), a date
+# ("mouse1\260930") or a session ("mouse1\260930\932_3dir_rec000"). Anything
+# below a listed folder is skipped too.
+EXCLUDE = []
+SEARCH_DEPTH = 3           # how many folder levels below a given folder to search
+SKIP_EXISTING = True      # True: skip sessions that already have Suite2p output
+                           # (suite2p\plane0\stat.npy), e.g. to resume a batch
 
 FS = 31.25            # imaging frame rate (Hz) of the concatenated movie -- set this
 TAU = 0.7            # indicator decay (s): ~0.7 GCaMP6f, ~1.0-1.25 GCaMP6s
@@ -477,10 +501,68 @@ def _run_session(sess_dir, plane_dir, settings, label):
     print(f"  finished: {datetime.now():%Y-%m-%d %H:%M:%S} (total {fmt_time(time.time() - t0)})")
 
 
+def is_excluded(path):
+    """True if path is, or is below, a folder listed in EXCLUDE (relative to ROOT_DIR)."""
+    try:
+        rel = os.path.relpath(path, ROOT_DIR).lower()
+    except ValueError:                      # different drive
+        return False
+    for e in EXCLUDE:
+        e = os.path.normpath(e).lower().strip(os.sep)
+        if rel == e or rel.startswith(e + os.sep):
+            return True
+    return False
+
+
+def find_sessions(folders):
+    """Session folders (those holding MC_TIF) in or below the given folders."""
+    sessions = []
+    for folder in folders:
+        folder = os.path.abspath(folder)
+        if not os.path.isdir(folder):
+            print(f"  ! not a folder, skipped: {folder}")
+            continue
+        if os.path.isfile(os.path.join(folder, MC_TIF)):
+            found = [folder]
+        else:
+            found = []
+            base_depth = folder.rstrip(os.sep).count(os.sep)
+            for root, dirs, files in os.walk(folder):
+                dirs.sort()
+                if MC_TIF in files:
+                    found.append(root)
+                    dirs[:] = []                    # a session has no sessions inside
+                elif root.count(os.sep) - base_depth >= SEARCH_DEPTH:
+                    dirs[:] = []
+                else:                               # never look inside output folders
+                    dirs[:] = [d for d in dirs if d.lower() not in ("suite2p", "caiman", "celltype")
+                               and not is_excluded(os.path.join(root, d))]
+            print(f"  {folder}: {len(found)} session(s) found" if found
+                  else f"  ! no {MC_TIF} found in or below {folder}")
+        for s in found:
+            if is_excluded(s):
+                print(f"  excluded, skipped: {s}")
+            elif s not in sessions:
+                sessions.append(s)
+    if SKIP_EXISTING:
+        done = [s for s in sessions
+                if os.path.isfile(os.path.join(s, "suite2p", "plane0", "stat.npy"))]
+        for s in done:
+            print(f"  already has Suite2p output, skipped: {s}")
+        sessions = [s for s in sessions if s not in done]
+    return sessions
+
+
 if __name__ == "__main__":
-    sessions = sys.argv[1:] or SESSIONS
+    folders = sys.argv[1:] or SESSIONS or [ROOT_DIR]
+    if not (sys.argv[1:] or SESSIONS):
+        print(f"No session list given: searching all of {ROOT_DIR}")
+    sessions = find_sessions(folders)
     if not sessions:
-        sys.exit("Give session folders as arguments or fill in SESSIONS.")
+        sys.exit("No sessions to process.")
+    print(f"{len(sessions)} session(s) to process:")
+    for k, s in enumerate(sessions, 1):
+        print(f"  [{k}] {s}")
     print_settings()
     settings = make_settings()
     failed = []

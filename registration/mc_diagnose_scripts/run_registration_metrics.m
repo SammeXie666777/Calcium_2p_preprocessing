@@ -1,6 +1,6 @@
 % DEMO_REGISTRATION_METRICS  Check and report motion-correction quality.
 %
-% Runs registration_metrics.m on a motion-corrected movie (and, if given,
+% Runs mc_diag_method.metrics on a motion-corrected movie (and, if given,
 % the raw movie before correction), prints a report in the command window
 % and saves all figures. Two modes:
 %   'synthetic' - builds a movie of sparse "neurons"; the clean version is
@@ -19,7 +19,17 @@
 % Each check gets OK / CHECK against the rule-of-thumb thresholds in thr
 % (heuristics for this lab's data, not Suite2p or CaImAn standards).
 %
-% Requires registration_metrics.m (this folder).
+% Inputs may also be Scanbox recordings: if mcTif or rawTif is an .sbx (with or
+% without the extension, and no tif of that name), it is converted with
+% sbx_method.toTif first. The raw movie may have a different number of frames
+% than the corrected one (the two are analysed independently), but it must
+% be the same size, i.e. cropped the way motion correction was cropped: the
+% conversion uses the crop recorded in _shifts.mat (crop.raw) when there is
+% one, else sbxCrop; the corrected movie's valid-region crop is then applied
+% with outRows/outCols from _shifts.mat.
+%
+% Requires mc_diag_method.m (registration folder) and, for .sbx input,
+% sbx_method.m.
 
 %%%%%%%%%%%%%%%%%%
 %%% USER INPUT %%%
@@ -28,10 +38,17 @@ clear; close all
 mode = 'data';          % 'synthetic' or 'data'
 
 % data mode
-mcTif  = 'Y:\mouse1\260928\932_3dir_rec000\ConcatenatedMovie_MC.tif';                 % ...\<session>\ConcatenatedMovie_MC.tif
-rawTif = 'Y:\mouse1\260928\acq1_000_001_ch1.tif';                 % optional raw tif of the same recording ('' = none),
+mcTif  = 'Y:\mouse1\261009\932_1dir_left_rec001\ConcatenatedMovie_MC.tif';                 % ...\<session>\ConcatenatedMovie_MC.tif
+rawTif = 'Y:\mouse1\261009\ACQ1_000_001.sbx';                 % optional raw tif of the same recording ('' = none),
                              % exported with the same 'crop' as motion correction;
                              % cropped to the MC output with outRows/outCols
+% .sbx input (only used when mcTif / rawTif is a Scanbox recording)
+sbxChannel = 1;              % PMT channel to convert (1 = green, 2 = red)
+sbxCrop    = [1 80 Inf Inf]; % raw-frame crop for the conversion when no _shifts.mat
+                             % gives the crop used by motion correction (its wins)
+sbxFrames  = [1 Inf];        % [first last] frames to convert (e.g. [1 3000] to test)
+sbxOutDir  = '';             % '' = next to the .sbx. An existing <name>_ch#.tif is
+                             % reused as is: delete it after changing sbxCrop/sbxFrames
 maxFrames = Inf;             % use only the first N frames (speed); the movies are
                              % streamed from disk, so memory does not grow with N
 margin = 0;                  % extra px ignored on every side of the MC movie
@@ -60,12 +77,10 @@ switch mode
         name = 'synthetic';
         opts = {'yrange', [8 size(mc,1)-8], 'xrange', [8 size(mc,2)-8], 'blockSize', [96 96]};
     case 'data'
-        if ~isfile(mcTif)
-            error('mcTif not found: %s', mcTif);
-        end
+        mcTif = resolveMovie(mcTif, sbxChannel, sbxCrop, sbxFrames, sbxOutDir, 'corrected movie');
         [d, n] = fileparts(mcTif);
         name = n;
-        mc = mcTif;                  % path: registration_metrics streams it from disk
+        mc = mcTif;                  % path: mc_diag_method.metrics streams it from disk
         sf = fullfile(d, [n '_shifts.mat']);
         if isfile(sf)
             S = load(sf, 'dy', 'dx', 'bad', 'cmax', 'nonrigid', 'outRows', 'outCols');
@@ -75,6 +90,14 @@ switch mode
         mcSize = tifFrameSize(mcTif);
         raw = [];
         if ~isempty(rawTif)
+            cropUsed = sbxCrop;                       % crop of the raw movie = the one
+            if isfile(sf) && ismember('crop', who('-file', sf))   % motion correction used
+                C = load(sf, 'crop');
+                if isstruct(C.crop) && isfield(C.crop, 'raw')
+                    cropUsed = double(C.crop.raw(:)');
+                end
+            end
+            rawTif = resolveMovie(rawTif, sbxChannel, cropUsed, sbxFrames, sbxOutDir, 'raw movie');
             raw = rawSource(rawTif, mcSize, S);
         end
         opts = {'yrange', [1+margin mcSize(1)-margin], 'xrange', [1+margin mcSize(2)-margin]};
@@ -83,8 +106,8 @@ switch mode
 end
 
 %% METRICS
-fprintf('Running registration_metrics on the corrected movie ...\n');
-M = registration_metrics(mc, opts{:}, 'rawMov', raw, 'rawPC', runPCraw, ...
+fprintf('Running mc_diag_method.metrics on the corrected movie ...\n');
+M = mc_diag_method.metrics(mc, opts{:}, 'rawMov', raw, 'rawPC', runPCraw, ...
     'maxFrames', maxFrames, 'plot', true);
 Mr = [];
 if ~isempty(M.regDXRaw)
@@ -301,6 +324,38 @@ end
 truth = 'rigid dy +/-2 px, dx +/-1 px (800-frame period); non-rigid dy +/-1 px across x (350-frame period)';
 end
 
+function tif = resolveMovie(p, chan, crop, frames, outDir, what)
+% Path of a tif for p. A Scanbox recording (.sbx, with or without the extension
+% when no file of that exact name exists) is converted with sbx_method.toTif to
+% <name>_ch<chan>.tif (uncompressed, same raw crop as motion correction); a tif
+% is returned as is.
+p = char(p);
+[~, ~, e] = fileparts(p);
+isSbx = strcmpi(e, '.sbx') || (~isfile(p) && isfile([p '.sbx']));
+if ~isSbx
+    if ~isfile(p)
+        error('%s not found: %s', what, p);
+    end
+    tif = p;
+    return
+end
+base = regexprep(p, '\.sbx$', '', 'ignorecase');
+if ~isfile([base '.sbx'])
+    error('%s: %s.sbx not found', what, base);
+end
+if exist('sbx_method', 'class') ~= 8
+    error('sbx_method.m is not on the path (it is in the registration folder).');
+end
+fprintf('  %s is a Scanbox recording: converting channel %d to tif (crop %s) ...\n', ...
+    what, chan, mat2str(crop));
+args = {'channels', chan, 'crop', crop, 'frames', frames};
+if ~isempty(outDir)
+    args = [args {'outDir', outDir}];
+end
+out = sbx_method.toTif(base, args{:});
+tif = out{1};
+end
+
 function sz = tifFrameSize(path)
 % [rows cols] of the first page of a tif, without reading image data.
 w = warning('off', 'imageio:tiffmexutils:libtiffWarning');
@@ -311,7 +366,7 @@ sz = [t.getTag('ImageLength') t.getTag('ImageWidth')];
 end
 
 function raw = rawSource(rawTif, mcSize, S)
-% Raw movie for registration_metrics, covering the pixels of the MC output:
+% Raw movie for mc_diag_method.metrics, covering the pixels of the MC output:
 % the path itself if the sizes match, else struct('path', 'rows', 'cols')
 % with outRows/outCols of the _shifts.mat (which refer to the raw frame
 % after the motion-correction 'crop').
@@ -322,8 +377,9 @@ if isequal(rawSize, mcSize)
 end
 if isempty(S) || ~isfield(S, 'outRows') || max(S.outRows) > rawSize(1) || max(S.outCols) > rawSize(2)
     error(['Raw movie is %dx%d px and MC movie %dx%d px, and the _shifts.mat outRows/outCols ' ...
-        'do not fit. Export the raw tif with the same ''crop'' as motion correction.'], ...
-        rawSize, mcSize);
+        'do not fit. The two must be the same size: export / convert the raw movie with the ' ...
+        'same ''crop'' as motion correction (an old converted _ch#.tif with another crop is ' ...
+        'reused if it exists: delete it).'], rawSize, mcSize);
 end
 raw = struct('path', rawTif, 'rows', S.outRows(:)', 'cols', S.outCols(:)');
 end

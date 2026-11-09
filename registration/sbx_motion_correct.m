@@ -88,6 +88,14 @@ function out = sbx_motion_correct(sbxFiles, varargin)
 %   'cropPrctile'    (0.5) output crop covers rigid shifts between this
 %                    percentile and 100 minus it; more extreme frames get
 %                    edge pixels replicated instead of shrinking the FOV.
+%   'outCrop'        ([]) [row1 col1 row2 col2] output rectangle in RAW sbx
+%                    frame pixels (the same convention as crop.out in the
+%                    output). [] = the region valid for this run's own shifts,
+%                    which differs between runs (a short reference moves less
+%                    than 30000 frames of a session). Give the same rectangle
+%                    to several runs, e.g. the green movie and the red
+%                    reference, and their tifs cover exactly the same pixels.
+%                    Frames that moved beyond it get edge pixels replicated.
 %   'nonrigid'       (false) add piecewise-rigid (block) correction after
 %                    the rigid step.
 %   'blockSize'      ([128 128]) block size in px [rows cols] (or scalar).
@@ -114,6 +122,41 @@ function out = sbx_motion_correct(sbxFiles, varargin)
 %                    serially instead.
 %   'writeOutput'    (true) false = only estimate and save shifts.
 %   'verbose'        (true) print progress.
+%   'bidiShift'      (0) correction of the bidirectional scan phase error
+%                    (even and odd lines displaced in x relative to each
+%                    other, a comb on vertical edges that blurs the mean
+%                    image and that motion correction cannot remove).
+%                      0       off (the offset is still estimated and
+%                              recorded in out.bidi, but not applied)
+%                      'auto'  estimate from the data and apply
+%                      number  apply this lag (px) = out.bidi.lag
+%                              convention below
+%                    Applied when the frames are read, before the template,
+%                    motion estimation and the output tif, on the
+%                    full-width rows (before 'crop'). Each scan direction
+%                    is moved by half the lag in opposite directions
+%                    (Lanczos-3 sub-pixel interpolation along the row), so
+%                    the image stays centred. The same shift is used for
+%                    every channel read.
+%   'bidiNFrames'    (200) frames, evenly spaced over the recording, used
+%                    to estimate the lag.
+%   'bidiMaxLag'     (8) largest |lag| (px) searched.
+%   'bidiBands'      (4) number of column bands for the per-band lag
+%                    (a lag that changes across x leaves a residual comb).
+%   'diagnostics'    (false) true = draw the diagnostic figures (see
+%                    mc_diag_method.session) from the frames this function already
+%                    has in memory during pass 2, with no re-reading of the
+%                    .sbx or the tif. Collected during pass 2: mean F and the
+%                    correlation with the template of every frame (raw and
+%                    corrected), mean images of time bins, and a sample of
+%                    frames (raw and corrected) for the PC1 maps. Needs
+%                    writeOutput. 'raw' here is after the scan-phase
+%                    correction, before motion correction. Memory: two copies
+%                    of the sample (2 x nSample frames of the output size).
+%   'diagDir'        ('' = <outfile folder>\mc_diagnostics) figure folder.
+%   'diagOpts'       ({}) name-value options of mc_diag_method.session: 'name',
+%                    'nSample' (here 1000 if not given), 'nBins', 'nPC',
+%                    'segNPC', 'zoomSize', 'smoothWin'.
 %
 % OUTPUT (struct, also saved to *_shifts.mat)
 %   dy, dx      - [nFrames x 1] rigid shifts applied (px, after clean-up)
@@ -143,7 +186,33 @@ function out = sbx_motion_correct(sbxFiles, varargin)
 %                               raw-frame px (raw crop + valid-region crop)
 %                   outSize     [rows cols] of the output tif
 %   frameIndex  - [nFrames x 2] [file #, 0-based frame # in that .sbx]
+%   bidi        - bidirectional scan phase offset, estimated on the raw
+%                 frames (always recorded, applied only if 'bidiShift'):
+%                   mode        'off' | 'auto' | 'manual'
+%                   lag         px, global estimate BEFORE correction.
+%                               CONVENTION: lag > 0 = features of the odd
+%                               rows (1,3,5.. of the raw frame) lie lag
+%                               columns to the RIGHT of the same features
+%                               in the even rows (2,4,6..).
+%                   applied     [shiftOdd shiftEven] px actually applied;
+%                               out(:,c) = in(:,c - shift) (+ = to the
+%                               right). [0 0] = nothing applied.
+%                               Applied shifts = [-lag/2, +lag/2].
+%                   lagMedian, lagMAD  per-frame lags: median and MAD
+%                   lagBands    lag per column band (before correction)
+%                   bandCols    [nBands x 2] first/last raw-frame column of
+%                               each band
+%                   lags, cc    lags searched (px) and mean correlation
+%                               (all columns) before correction
+%                   lagAfter, lagBandsAfter, ccAfter   the same measured on
+%                               the corrected frames (residual; ~0 = good)
+%                   channel, nFrames, rows (raw-frame row range used),
+%                   reliable    false if the estimate was not trusted
+%                               (low correlation, or peak at the search
+%                               limit); an 'auto' estimate that is not
+%                               reliable is not applied.
 %   files, outfile, params, timeElapsed
+%               params.bidiShiftUsed = lag actually applied (px, 0 = off).
 %
 % EXAMPLE
 %   f = dir(fullfile(dateDir, '250314_001_*.sbx'));
@@ -178,6 +247,7 @@ defaults = {            % name, default (see help above)
     'outlierMinJump',   3
     'minPeakRatio',     0.3
     'cropPrctile',      0.5
+    'outCrop',          []
     'nonrigid',         true % default non-rigid mc
     'blockSize',        [128 128]
     'maxShiftNR',       5
@@ -189,6 +259,13 @@ defaults = {            % name, default (see help above)
     'poolProfile',      []
     'writeOutput',      true
     'verbose',          true
+    'bidiShift',        0
+    'bidiNFrames',      200
+    'bidiMaxLag',       8
+    'bidiBands',        4
+    'diagnostics',      false
+    'diagDir',          ''
+    'diagOpts',         {}
     };
 ip = inputParser;
 ip.FunctionName = mfilename;
@@ -223,7 +300,7 @@ vprint = @(varargin) p.verbose && fprintf(varargin{:});
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% FILE INFO & INDEXING %%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%
-src = cellfun(@sbx_file_info, sbxFiles, 'UniformOutput', false);
+src = cellfun(@sbx_method.info, sbxFiles, 'UniformOutput', false);
 src = [src{:}];
 if isempty(p.channel)
     % auto: functional green (1) if recorded in every file, else the one
@@ -273,7 +350,12 @@ crop = p.crop(:)';
 rc = [max(crop(1:2), 1), min(crop(3:4), [src(1).rows src(1).cols])];
 H = rc(3) - rc(1) + 1;
 W = rc(4) - rc(2) + 1;
-io = struct('src', src, 'cum', cum, 'rc', rc, 'useGPU', p.useGPU);
+io = struct('src', src, 'cum', cum, 'rc', rc, 'useGPU', p.useGPU, 'bidi', [0 0]);
+
+% bidirectional scan phase: always estimated on the raw frames and recorded;
+% applied (io.bidi, used by every frame read below) if 'bidiShift' asks for it
+[bidi, io.bidi] = resolveBidi(io, p, N, vprint);
+p.bidiShiftUsed = io.bidi(2) - io.bidi(1);       % = lag applied (0 = off)
 
 % estimation region: central crop to FFT-friendly sizes (factors 2,3,5,7)
 He = fastFFTSize(H);
@@ -381,6 +463,26 @@ if p.nonrigid
 end
 outRows = validRange(dy, H, p.cropPrctile, margin);
 outCols = validRange(dx, W, p.cropPrctile, margin);
+if ~isempty(p.outCrop)
+    % forced output rectangle (raw-frame pixels): the same pixels in every run
+    oc = double(p.outCrop(:)');
+    if numel(oc) ~= 4 || any(~isfinite(oc)) || oc(3) < oc(1) || oc(4) < oc(2)
+        error('outCrop must be [row1 col1 row2 col2] in raw-frame pixels.');
+    end
+    forcedRows = (oc(1):oc(3)) - (rc(1) - 1);        % into the cropped frame
+    forcedCols = (oc(2):oc(4)) - (rc(2) - 1);
+    if forcedRows(1) < 1 || forcedCols(1) < 1 || forcedRows(end) > H || forcedCols(end) > W
+        error(['outCrop [%d %d %d %d] is outside the cropped frame ' ...
+            '(raw rows %d-%d, cols %d-%d after ''crop'').'], oc, rc(1), rc(3), rc(2), rc(4));
+    end
+    if isempty(outRows) || isempty(outCols) || forcedRows(1) < outRows(1) || ...
+            forcedRows(end) > outRows(end) || forcedCols(1) < outCols(1) || forcedCols(end) > outCols(end)
+        vprint(['  note: outCrop reaches beyond the region valid for this movie''s shifts; ' ...
+            'edge pixels are replicated in the frames that moved most\n']);
+    end
+    outRows = forcedRows;
+    outCols = forcedCols;
+end
 if isempty(outRows) || isempty(outCols)
     error('Shifts are larger than the frame: no valid output region.');
 end
@@ -403,6 +505,7 @@ end
 meanImg = [];
 maxImg = [];
 nonrigidOut = [];
+dgn = [];                            % diagnostics collectors (p.diagnostics)
 if p.nonrigid
     [dyNR, dxNR] = deal(zeros(N, NR.nB, 'single'));
     lowSNR = false(N, NR.nB);
@@ -426,6 +529,17 @@ if p.writeOutput || p.nonrigid
         'writeOutput', p.writeOutput, 'subpixel', p.subpixel, 'er', er, 'ec', ec, ...
         'He', He, 'We', We, 'outRows', outRows, 'outCols', outCols, 'warpMethod', warpMethod);
     s2.NR = NR;
+    % statistics for the diagnostic figures, collected from the frames that
+    % are in memory anyway (see batchDiag)
+    s2.diag = [];
+    dgn = [];
+    if p.diagnostics
+        if p.writeOutput
+            [dgn, s2.diag] = initDiag(p, N, outRows, outCols, er, ec, gather(refImg));
+        else
+            warning('sbx_motion_correct:diag', '''diagnostics'' needs writeOutput; skipped.');
+        end
+    end
     if nW > 0 && p.nonrigid && ~isa(pool, 'parallel.ThreadPool')
         s2.NR = parallel.pool.Constant(NR);   % thread workers share memory: not needed
     end
@@ -446,12 +560,15 @@ if p.writeOutput || p.nonrigid
                 while nSubmitted < min(nBatch, b + nW2)
                     nSubmitted = nSubmitted + 1;
                     gs = batches{nSubmitted};
-                    futs{nSubmitted} = parfeval(pool, @pass2Batch, 4, io, gs, dy(gs), dx(gs), s2);
+                    futs{nSubmitted} = parfeval(pool, @pass2Batch, 5, io, gs, dy(gs), dx(gs), s2);
                 end
-                [Z, bdy, bdx, blow] = fetchOutputs(futs{b});
+                [Z, bdy, bdx, blow, dg] = fetchOutputs(futs{b});
                 futs{b} = [];
             else
-                [Z, bdy, bdx, blow] = pass2Batch(io, gi, dy(gi), dx(gi), s2);
+                [Z, bdy, bdx, blow, dg] = pass2Batch(io, gi, dy(gi), dx(gi), s2);
+            end
+            if ~isempty(dgn)
+                dgn = collectDiag(dgn, gi, dg);
             end
             if p.nonrigid
                 dyNR(gi, :) = bdy';
@@ -500,11 +617,115 @@ p.batchSize = B;
 out = struct('dy', dy, 'dx', dx, 'dyRaw', dyRaw, 'dxRaw', dxRaw, 'cmax', cmax, 'bad', bad, ...
     'nonrigid', nonrigidOut, 'refImg', gather(refImg), 'meanImg', meanImg, 'maxImg', maxImg, ...
     'outRows', outRows, 'outCols', outCols, 'crop', cropInfo(src(1), rc, outRows, outCols), ...
-    'frameIndex', frameIndex, 'files', {strcat(sbxFiles, '.sbx')}, 'outfile', p.outfile, 'params', p, ...
+    'frameIndex', frameIndex, 'bidi', bidi, 'files', {strcat(sbxFiles, '.sbx')}, 'outfile', p.outfile, 'params', p, ...
     'timeElapsed', toc(timerStart));
 [od, on] = fileparts(p.outfile);
 save(fullfile(od, [on '_shifts.mat']), '-struct', 'out', '-v7.3');
 vprint('sbx_motion_correct done in %.1f s -> %s\n', out.timeElapsed, p.outfile);
+
+% diagnostic figures from the data kept during pass 2 (nothing is re-read)
+if ~isempty(dgn)
+    try
+        diagDir = p.diagDir;
+        if isempty(diagDir)
+            diagDir = fullfile(od, 'mc_diagnostics');
+        end
+        cnt = reshape(max(dgn.cnt, 1), 1, 1, []);
+        data = struct('corSample', dgn.Xcor, 'rawSample', dgn.Xraw, 'sampleIdx', dgn.sampleIdx, ...
+            'meanF', struct('cor', dgn.meanFcor, 'raw', dgn.meanFraw), ...
+            'frameCorr', struct('cor', dgn.cCor, 'raw', dgn.cRaw), 'corrRef', 'template', ...
+            'binImg', struct('cor', single(dgn.sumCor ./ cnt), 'raw', single(dgn.sumRaw ./ cnt)), ...
+            'segNames', {regexprep(sbxFiles, '.*[\\/]', '')}, ...
+            'rawNote', 'raw = scan-phase corrected, no motion correction', ...
+            'shifts', struct('dy', dy, 'dx', dx, 'cmax', cmax, 'bad', bad, 'nonrigid', {nonrigidOut}, ...
+                'frameIndex', frameIndex, 'crop', out.crop, 'bidi', bidi, 'outRows', outRows, ...
+                'outCols', outCols, 'params', p));
+        name = optGet(p.diagOpts, 'name', on);
+        opts = p.diagOpts;
+        k = find(strcmpi(opts(1:2:end), 'name'), 1);
+        if ~isempty(k)
+            opts(2*k-1:2*k) = [];
+        end
+        mc_diag_method.session(data, [], diagDir, 'name', name, opts{:});
+    catch ME
+        warning('sbx_motion_correct:diag', 'Diagnostic figures failed: %s', ME.message);
+    end
+end
+end
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% BIDIRECTIONAL SCAN PHASE (even/odd) %%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function [bidi, shifts] = resolveBidi(io, p, N, vprint)
+% Estimate the even/odd-row offset on the raw frames, decide what to apply
+% from p.bidiShift, verify the residual after correction, and return the
+% documentation struct (saved as out.bidi) and the [odd even] row shifts.
+mode = 'off';
+if ischar(p.bidiShift) || isstring(p.bidiShift)
+    if ~strcmpi(char(p.bidiShift), 'auto')
+        error('''bidiShift'' must be 0, a number (px) or ''auto''.');
+    end
+    mode = 'auto';
+elseif isnumeric(p.bidiShift) && isscalar(p.bidiShift) && isfinite(p.bidiShift)
+    if p.bidiShift ~= 0
+        mode = 'manual';
+    end
+else
+    error('''bidiShift'' must be 0, a number (px) or ''auto''.');
+end
+
+bidi = sbx_method.bidiOffset({io.src.path}, 'channel', p.alignChannel, 'crop', io.rc, ...
+    'first', io.src(1).first, 'nFrames', p.bidiNFrames, 'maxLag', p.bidiMaxLag, ...
+    'bands', p.bidiBands, 'shifts', [0 0]);
+bidi.mode = mode;
+lag = 0;
+switch mode
+    case 'auto'
+        if bidi.reliable
+            lag = bidi.lag;
+        else
+            warning('sbx_motion_correct:bidi', ...
+                'bidiShift auto: estimate not reliable (lag %.2f px, peak corr %.2f); not applied.', ...
+                bidi.lag, max(bidi.cc(:)));
+        end
+    case 'manual'
+        lag = double(p.bidiShift);
+end
+shifts = [-lag/2, lag/2];
+bidi.applied = shifts;
+bidi.lagAfter = NaN;
+bidi.lagBandsAfter = nan(size(bidi.lagBands));
+bidi.ccAfter = [];
+if lag ~= 0
+    A = sbx_method.bidiOffset({io.src.path}, 'channel', p.alignChannel, 'crop', io.rc, ...
+    'first', io.src(1).first, 'nFrames', p.bidiNFrames, 'maxLag', p.bidiMaxLag, ...
+    'bands', p.bidiBands, 'shifts', shifts);
+    bidi.lagAfter = A.lag;
+    bidi.lagBandsAfter = A.lagBands;
+    bidi.ccAfter = A.cc;
+end
+bidi.convention = ['lag > 0: features of odd raw rows lie lag columns right of the same features ' ...
+    'in even rows. applied = [shiftOdd shiftEven] px, out(:,c) = in(:,c-shift) (+ = right) = [-lag/2 +lag/2].'];
+
+vprint('Bidirectional scan offset (even vs odd rows): %+.2f px (per-frame median %+.2f, MAD %.2f; bands %s)%s\n', ...
+    bidi.lag, bidi.lagMedian, bidi.lagMAD, mat2str(round(bidi.lagBands, 2)), ...
+    ternary(bidi.reliable, '', '  [NOT RELIABLE]'));
+if lag ~= 0
+    vprint('  applied %+.2f px (odd rows %+.2f, even rows %+.2f); residual after correction %+.2f px (bands %s)\n', ...
+        lag, shifts(1), shifts(2), bidi.lagAfter, mat2str(round(bidi.lagBandsAfter, 2)));
+else
+    vprint('  not applied (bidiShift = %s)\n', ternary(strcmp(mode, 'off'), '0', 'auto, unreliable'));
+end
+end
+
+function s = ternary(c, a, b)
+if c
+    s = a;
+else
+    s = b;
+end
 end
 
 
@@ -674,8 +895,10 @@ NR.nbx = numel(xs);
 NR.nB = NR.nby * NR.nbx;
 NR.bs = bs;
 [IY, IX] = ndgrid(1:NR.nby, 1:NR.nbx);
-NR.rows = ys(IY(:))' + (0:bs(1)-1);       % [nB x bs(1)] pixel rows of each block
-NR.cols = xs(IX(:))' + (0:bs(2)-1);
+% reshape: ys(IY(:)) is a row vector when ys is a row, but takes the shape of
+% the index when ys is a scalar (a single block row/column, e.g. strips)
+NR.rows = reshape(ys(IY(:)), [], 1) + (0:bs(1)-1);       % [nB x bs(1)] pixel rows of each block
+NR.cols = reshape(xs(IX(:)), [], 1) + (0:bs(2)-1);
 % neighbour weights for smoothing low-SNR blocks (rows sum to 1)
 Wn = exp(-((IY(:) - IY(:)').^2 + (IX(:) - IX(:)').^2) / (2 * p.nrNeighborSigma^2));
 NR.Wn = Wn ./ sum(Wn, 2);
@@ -761,7 +984,11 @@ function snr = blockSNR(cc, lagY, lagX)
 % cc: [L*L x nB x m]; returns [nB x m].
 [pk, k] = max(cc, [], 1);
 side = cc;
-side(abs(lagY - lagY(k)) <= 2 & abs(lagX - lagX(k)) <= 2) = -Inf;
+% reshape: lagY(k) takes the (column) orientation of lagY when k is a vector,
+% i.e. when a sub-batch holds a single frame (m = 1) or there is one block
+lagYk = reshape(lagY(k), size(k));
+lagXk = reshape(lagX(k), size(k));
+side(abs(lagY - lagYk) <= 2 & abs(lagX - lagXk) <= 2) = -Inf;
 side = max(side, [], 1);
 snr = pk ./ side;
 snr(side <= 0) = Inf;
@@ -799,15 +1026,16 @@ end
 %%% PASS 2 BATCH & PARALLEL HELPERS %%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-function [Z, bdy, bdx, blow] = pass2Batch(io, gi, dy, dx, s)
+function [Z, bdy, bdx, blow, dg] = pass2Batch(io, gi, dy, dx, s)
 % One batch of pass 2 (runs on a worker or here): optional non-rigid block
 % estimate, then shift/warp the output channel to uint16. Z = [] when not
-% writing; bdy/bdx/blow = [] when rigid only.
+% writing; bdy/bdx/blow = [] when rigid only; dg = [] unless s.diag (batch
+% statistics for the diagnostic figures).
 NR = s.NR;
 if isa(NR, 'parallel.pool.Constant')
     NR = NR.Value;
 end
-[Z, bdy, bdx, blow] = deal([]);
+[Z, bdy, bdx, blow, dg] = deal([]);
 if s.nonrigid
     % rigidly align the estimation region, then block phase correlation
     Ya = loadFrames(io, gi, s.alignChannel);
@@ -827,6 +1055,98 @@ if s.writeOutput
         Z = applyShifts(Y, dy, dx, s.outRows, s.outCols);
     end
     Z = uint16(gather(Z));
+    if ~isempty(s.diag)
+        dg = batchDiag(Y, Z, gi, s.outRows, s.outCols, s.diag);
+    end
+end
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% DIAGNOSTICS COLLECTED DURING PASS 2    %%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function [dgn, dspec] = initDiag(p, N, outRows, outCols, er, ec, refImg)
+% Collectors (dgn, kept here) and what each batch needs (dspec).
+ns = min(optGet(p.diagOpts, 'nSample', 1000), N);
+nBins = optGet(p.diagOpts, 'nBins', 6);
+ly = numel(outRows);
+lx = numel(outCols);
+rI = intersect(outRows, er);               % pixels shared by the output and the template
+cI = intersect(outCols, ec);
+dspec = struct('sample', unique(round(linspace(1, N, ns))), 'nBins', nBins, 'N', N, ...
+    'zR', rI - outRows(1) + 1, 'zC', cI - outCols(1) + 1, ...
+    'ref', single(refImg(rI - er(1) + 1, cI - ec(1) + 1)));
+ns = numel(dspec.sample);
+dgn = struct('sampleIdx', dspec.sample, 'nBins', nBins, ...
+    'meanFraw', zeros(N, 1), 'meanFcor', zeros(N, 1), 'cRaw', zeros(N, 1), 'cCor', zeros(N, 1), ...
+    'sumRaw', zeros(ly, lx, nBins), 'sumCor', zeros(ly, lx, nBins), 'cnt', zeros(1, nBins), ...
+    'Xraw', zeros(ly, lx, ns, 'uint16'), 'Xcor', zeros(ly, lx, ns, 'uint16'));
+end
+
+function dg = batchDiag(Y, Z, gi, outRows, outCols, dspec)
+% Statistics of one batch: Y = raw frames of the output channel (after the
+% scan-phase correction, before motion correction), Z = corrected frames
+% (uint16), compared on the same output pixels.
+Yo = uint16(gather(Y(outRows, outCols, :)));
+n = numel(gi);
+dg.meanFraw = reshape(double(mean(mean(Yo, 1), 2)), [], 1);
+dg.meanFcor = reshape(double(mean(mean(Z, 1), 2)), [], 1);
+% correlation of every frame with the registration template (shared pixels)
+ref = dspec.ref(:) - mean(dspec.ref(:));
+ref = ref / norm(ref);
+dg.cRaw = zeros(n, 1);
+dg.cCor = zeros(n, 1);
+for k0 = 1:100:n
+    k = k0:min(k0 + 99, n);
+    A = single(reshape(Yo(dspec.zR, dspec.zC, k), [], numel(k)));
+    A = A - mean(A, 1);
+    dg.cRaw(k) = double((ref' * A) ./ sqrt(sum(A.^2, 1)))';
+    B = single(reshape(Z(dspec.zR, dspec.zC, k), [], numel(k)));
+    B = B - mean(B, 1);
+    dg.cCor(k) = double((ref' * B) ./ sqrt(sum(B.^2, 1)))';
+end
+% sums for the time-bin mean images
+bin = min(dspec.nBins, ceil(gi / dspec.N * dspec.nBins));
+ub = unique(bin(:))';
+dg.bins = ub;
+dg.cnt = arrayfun(@(b) nnz(bin == b), ub);
+dg.sumRaw = zeros(size(Yo, 1), size(Yo, 2), numel(ub));
+dg.sumCor = zeros(size(Yo, 1), size(Yo, 2), numel(ub));
+for i = 1:numel(ub)
+    dg.sumRaw(:, :, i) = sum(Yo(:, :, bin == ub(i)), 3, 'double');
+    dg.sumCor(:, :, i) = sum(Z(:, :, bin == ub(i)), 3, 'double');
+end
+% PCA sample frames
+sel = ismember(gi, dspec.sample);
+dg.sIdx = gi(sel);
+dg.Xraw = Yo(:, :, sel);
+dg.Xcor = Z(:, :, sel);
+end
+
+function dgn = collectDiag(dgn, gi, dg)
+dgn.meanFraw(gi) = dg.meanFraw;
+dgn.meanFcor(gi) = dg.meanFcor;
+dgn.cRaw(gi) = dg.cRaw;
+dgn.cCor(gi) = dg.cCor;
+for i = 1:numel(dg.bins)
+    b = dg.bins(i);
+    dgn.sumRaw(:, :, b) = dgn.sumRaw(:, :, b) + dg.sumRaw(:, :, i);
+    dgn.sumCor(:, :, b) = dgn.sumCor(:, :, b) + dg.sumCor(:, :, i);
+    dgn.cnt(b) = dgn.cnt(b) + dg.cnt(i);
+end
+if ~isempty(dg.sIdx)
+    [~, pos] = ismember(dg.sIdx, dgn.sampleIdx);
+    dgn.Xraw(:, :, pos) = dg.Xraw;
+    dgn.Xcor(:, :, pos) = dg.Xcor;
+end
+end
+
+function v = optGet(c, name, default)
+% value of a name-value pair in the cell c, or default
+v = default;
+k = find(strcmpi(c(1:2:end), name), 1);
+if ~isempty(k)
+    v = c{2*k};
 end
 end
 
@@ -905,7 +1225,7 @@ end
 function Y = loadFrames(io, gidx, channel)
 % Frames with global indices gidx from one channel, cropped, as single
 % (on the GPU if io.useGPU).
-Y = readFrames(io.src, io.cum, gidx, channel, io.rc);
+Y = readFrames(io.src, io.cum, gidx, channel, io.rc, io.bidi);
 if io.useGPU
     Y = gpuArray(Y);      % move uint16 first: half the transfer size
 end
@@ -919,34 +1239,25 @@ end
 Y = single(Y);
 end
 
-function Y = readFrames(src, cum, gidx, channel, rc)
+function Y = readFrames(src, cum, gidx, channel, rc, bidi)
 % Read frames with global (concatenated, 1-based) indices gidx, sorted
 % ascending, from one PMT channel; returns cropped uint16 [rows cols n].
+% bidi = [shiftOdd shiftEven] px: column shift of the odd / even raw rows
+% (out(:,c) = in(:,c-shift)) applied before cropping; [0 0] = none.
+% The file reading and the scan-phase (even/odd row) shift are in
+% sbx_method.read, shared with the diagnostics.
+if nargin < 6
+    bidi = [0 0];
+end
 Y = zeros(rc(3)-rc(1)+1, rc(4)-rc(2)+1, numel(gidx), 'uint16');
-pos = 0;
 for f = 1:numel(src)
-    sel = gidx > cum(f) & gidx <= cum(f+1);
-    if ~any(sel)
+    sel = find(gidx > cum(f) & gidx <= cum(f+1));
+    if isempty(sel)
         continue
     end
     d = src(f).first + gidx(sel) - cum(f) - 1;    % 0-based frame on disk
-    brk = [0, find(diff(d(:)') ~= 1), numel(d)];  % contiguous runs
-    ci = find(src(f).chs == channel);
-    fid = fopen(src(f).path, 'r');
-    closeFile = onCleanup(@() fclose(fid));
-    for r = 1:numel(brk)-1
-        n = brk(r+1) - brk(r);
-        fseek(fid, d(brk(r)+1) * src(f).frameBytes, 'bof');
-        x = fread(fid, src(f).frameBytes / 2 * n, 'uint16=>uint16');
-        if numel(x) ~= src(f).frameBytes / 2 * n
-            error('Short read in %s at frame %d', src(f).path, d(brk(r)+1));
-        end
-        % on disk: [chan col row frame], values inverted (as in sbxread)
-        x = permute(reshape(x, src(f).nchan, src(f).cols, src(f).rows, n), [3 2 4 1]);
-        Y(:, :, pos+(1:n)) = intmax('uint16') - x(rc(1):rc(3), rc(2):rc(4), :, ci);
-        pos = pos + n;
-    end
-    clear closeFile
+    Y(:, :, sel) = sbx_method.read(src(f).path, d, 'channel', channel, 'crop', rc, ...
+        'bidi', bidi, 'info', src(f));
 end
 end
 

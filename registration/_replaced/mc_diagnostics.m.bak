@@ -1,0 +1,543 @@
+function D = mc_diagnostics(src, sbxFiles, outDir, varargin)
+% MC_DIAGNOSTICS  Motion-correction diagnostic figures for one session.
+% Two input modes, one set of figures:
+%
+%   PATHS      read the motion-corrected tif and the raw .sbx files (no tif
+%              conversion of the raw data):
+%                D = mc_diagnostics(mcPath, sbxFiles, outDir, ...)
+%   VARIABLES  plot from data already in memory (what sbx_motion_correct
+%              hands over with 'diagnostics', true; nothing is re-read):
+%                D = mc_diagnostics(data, [], outDir, ...)
+%
+%   D = mc_diagnostics(mcPath, sbxFiles, outDir, 'name', 'session', ...
+%                      'channel', 1, 'nPC', 30, 'segNPC', 5, 'nSample', 2000, ...
+%                      'stride', 5, 'nBins', 6, 'zoomSize', 120, 'smoothWin', 50)
+%
+%   src       ConcatenatedMovie_MC.tif (its _shifts.mat is read too), or the
+%             'data' struct described below
+%   sbxFiles  cell of the .sbx files (paths, extension optional) that were
+%             concatenated, in the same order as in the motion correction
+%             (paths mode only; [] otherwise)
+%   outDir    folder for the figures (created)
+%
+%   data struct (variables mode):
+%     corSample, rawSample  [ly lx ns] uint16: the same ns evenly spaced
+%                           frames, corrected / before motion correction,
+%                           same output pixels
+%     sampleIdx             frame numbers of those samples
+%     meanF, frameCorr      structs with fields cor, raw: N x 1 per frame
+%     corrRef               what frameCorr is relative to ('template' or
+%                           'mean image')
+%     binImg                struct cor, raw: ly x lx x nBins mean images
+%     shifts                struct with the _shifts.mat fields dy, dx, cmax,
+%                           bad, nonrigid, frameIndex, crop, bidi, outRows,
+%                           outCols, params
+%     segNames              cell, one name per concatenated segment
+%     rawNote               how 'raw' was made (shown in titles)
+%   name      label used in figure titles
+%   channel   PMT channel of the corrected movie (1 = green)
+%   nPC       PCs of the corrected movie for the registration-offset metric
+%   segNPC    PCs for each raw segment (only PC1 is plotted)
+%   nSample   frames sampled for PCA (per movie / segment)
+%   stride    every Nth frame in the streaming pass (frame correlation, mean
+%             F, kymographs, time bins)
+%   nBins     time bins for the early-vs-late comparison
+%   zoomSize  side (px) of the zoomed patches
+%   smoothWin smoothing window (streamed samples) for the time-course plots
+%
+% Raw movies are the .sbx frames cropped with the same raw crop and output
+% rectangle as the corrected movie (crop.raw, outRows, outCols of the
+% _shifts.mat), WITHOUT motion or scan-phase correction, so raw and
+% corrected cover the same pixels.
+%
+% Figures (PNG, in outDir):
+%   01_timecourses            mean F per frame, rigid dy/dx, non-rigid
+%                             residual, correlation peak, frame-to-mean
+%                             correlation (raw vs corrected), PC1
+%   02_PC1_corrected          PC1 top / bottom means and their difference,
+%                             PC offsets (Suite2p registration metric)
+%   03_PC1_raw_segments       the same PC1 maps for every raw segment
+%   04_mean_image_raw_vs_corrected   mean images and their difference
+%   05_zoom_raw_vs_corrected  zoomed patches (brightest, most structured)
+%   06_bidi_scan_phase        even/odd scan-line offset: estimate, applied,
+%                             residual (needs out.bidi in the _shifts.mat)
+%   07_early_vs_late          first vs last time bin, raw and corrected
+%   08_kymographs             line profiles over time, raw and corrected
+% plus mc_diagnostics_summary.txt and mc_diagnostics.mat.
+
+ip = inputParser;
+ip.addParameter('name', '');
+ip.addParameter('channel', 1);
+ip.addParameter('nPC', 30);
+ip.addParameter('segNPC', 5);
+ip.addParameter('nSample', 2000);
+ip.addParameter('stride', 5);
+ip.addParameter('nBins', 6);
+ip.addParameter('zoomSize', 120);
+ip.addParameter('smoothWin', 50);
+ip.parse(varargin{:});
+o = ip.Results;
+
+% gather the metrics: by reading the files, or from variables handed over by
+% sbx_motion_correct (same M / Seg / S contents, same plots below)
+if isstruct(src)
+    if isempty(o.name), o.name = 'session'; end
+    [M, Seg, S, segNames, lbl] = fromData(src, o);
+else
+    if isempty(o.name), [~, o.name] = fileparts(src); end
+    [M, Seg, S, segNames, lbl] = fromFiles(src, sbxFiles, o);
+end
+if ~isfolder(outDir), mkdir(outDir); end
+ttl = strrep(o.name, '_', '\_');
+nSeg = numel(segNames);
+N = numel(S.dy);
+if N == 0, N = M.movSize(3); end
+segBreaks = [];
+if ~isempty(S.frameIndex)
+    segBreaks = find(diff(S.frameIndex(:, 1)) ~= 0) + 1;
+end
+segStart = [0 cumsum([Seg.T])];
+
+%% derived numbers
+nS = numel(M.streamIdx);
+b1 = 1:max(1, round(nS / o.nBins));                  % first time bin (streamed samples)
+F0 = mean(M.meanF(b1));
+F0raw = mean(M.meanFRaw(b1));
+shp.raw = sharpness(M.meanImgRaw);
+shp.cor = sharpness(M.meanImg);
+cs = @(x) [median(x(~isnan(x))), prctile1(x(~isnan(x)), 1)];
+fcCor = cs(M.frameCorr);
+fcRaw = cs(M.frameCorrRaw);
+nr = [];
+if ~isempty(S.nonrigid) && isstruct(S.nonrigid)
+    L = hypot(double(S.nonrigid.dy), double(S.nonrigid.dx));
+    nr = struct('mean', mean(L, 2), 'max', max(L, [], 2));
+end
+% early vs late (corrected and raw)
+el = struct();
+for kind = {'cor', 'raw'}
+    B = M.binImg;
+    if strcmp(kind{1}, 'raw'), B = M.binImgRaw; end
+    a = double(B(:, :, 1));
+    z = double(B(:, :, end));
+    [gx, gy] = imgradientxy(0.5 * (a + z), 'central');
+    ctr = {round(size(a, 1)*0.1):round(size(a, 1)*0.9), round(size(a, 2)*0.1):round(size(a, 2)*0.9)};
+    d = z - a;
+    [sy, sx] = phase_shift_img(a, z);
+    el.(kind{1}) = struct('first', a, 'last', z, 'diff', d, 'dy', sy, 'dx', sx, ...
+        'corrGain', corr2(d(ctr{:}), 0.5 * (a(ctr{:}) + z(ctr{:}))), ...
+        'corrShift', max(abs([corr2(d(ctr{:}), gx(ctr{:})), corr2(d(ctr{:}), gy(ctr{:}))])));
+    el.(kind{1}).sharpPerBin = arrayfun(@(b) sharpness(B(:, :, b)), 1:size(B, 3));
+end
+binCorr = nan(o.nBins);
+for a = 1:o.nBins
+    for b = 1:o.nBins
+        x = M.binImg(:, :, a); y = M.binImg(:, :, b);
+        binCorr(a, b) = corr2(x, y);
+    end
+end
+
+%% FIG 1: time courses
+cRaw = [0.85 0.33 0.10];
+f = newfig([1100 1250]);
+tl = tiledlayout(6, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+ax = gobjects(6, 1);
+ax(1) = nexttile; hold on
+plot(M.streamIdxRaw, M.meanFRaw / F0raw, 'Color', [1 0.8 0.65]);
+plot(M.streamIdx, M.meanF / F0, 'Color', [0.7 0.7 0.7]);
+hR = plot(M.streamIdxRaw, movmean(M.meanFRaw / F0raw, o.smoothWin), 'Color', cRaw, 'LineWidth', 1.3);
+hC = plot(M.streamIdx, movmean(M.meanF / F0, o.smoothWin), 'k', 'LineWidth', 1.3);
+legend([hR hC], {'raw (smoothed)', 'corrected (smoothed)'}, 'Location', 'best', 'Box', 'off');
+ylabel('mean F / first time bin'); title('Mean fluorescence per frame (dashed lines = segment boundaries)');
+ax(2) = nexttile; hold on
+if ~isempty(S.dy)
+    hy = plot(1:N, S.dy, 'b'); hx = plot(1:N, S.dx, 'r');
+    legend([hy hx], {'dy (rows)', 'dx (columns)'}, 'Location', 'best', 'Box', 'off');
+end
+ylabel('rigid shift (px)'); title(sprintf('Rigid shift applied by motion correction  (SD: dy %.2f, dx %.2f px)', ...
+    std(S.dy), std(S.dx)));
+ax(3) = nexttile; hold on
+if ~isempty(nr)
+    h1 = plot(1:N, nr.max, 'Color', [0.75 0.75 0.75]);
+    h2 = plot(1:N, nr.mean, 'k');
+    legend([h2 h1], {'mean over blocks', 'max over blocks'}, 'Location', 'best', 'Box', 'off');
+else
+    text(0.5, 0.5, 'non-rigid correction off', 'Units', 'normalized', 'HorizontalAlignment', 'center');
+end
+ylabel('residual block shift (px)'); title('Non-rigid residual shift after the rigid step (per frame, over blocks)');
+ax(4) = nexttile; hold on
+if ~isempty(S.cmax)
+    plot(1:N, S.cmax, 'k');
+    if ~isempty(S.bad) && any(S.bad)
+        plot(find(S.bad), S.cmax(S.bad), 'r.');
+    end
+end
+ylabel('correlation peak'); title(sprintf('Phase-correlation peak of the rigid fit (red = outlier frames, %.2f %%)', ...
+    100 * mean(S.bad)));
+ax(5) = nexttile; hold on
+plot(M.streamIdxRaw, M.frameCorrRaw, 'Color', cRaw);
+plot(M.streamIdx, M.frameCorr, 'k');
+legend({sprintf('raw (median %.3f)', fcRaw(1)), sprintf('corrected (median %.3f)', fcCor(1))}, ...
+    'Location', 'best', 'Box', 'off');
+ylabel(['corr. with ' lbl.ref]); title(sprintf('Frame-to-%s correlation (dips = residual motion, z-change or blur)', lbl.ref));
+ax(6) = nexttile; hold on
+plot(M.frameIdx, M.tPC(:, 1), 'k');
+ylabel('PC1 projection (a.u.)'); xlabel('frame of the concatenated movie');
+title('PC1 time course of the corrected movie (slow ramp / steps = drift or state change)');
+for a = ax', xlim(a, [1 N]); box(a, 'off'); segLines(a, segBreaks); end
+linkaxes(ax, 'x');
+title(tl, [ttl ' - motion-correction time courses'], 'FontWeight', 'bold');
+saveFig(f, fullfile(outDir, '01_timecourses.png'));
+
+%% FIG 2: PC1 of the corrected movie
+nTop = M.opts.nTop;
+f = newfig([1300 800]);
+tl = tiledlayout(2, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
+lim = prctile1([M.topMean(:, :, 1); M.botMean(:, :, 1)], [1 99.7]);
+nexttile; imagesc(M.topMean(:, :, 1), lim); axis image off; colormap(gca, gray); cb = colorbar; ylabel(cb, 'mean F (a.u.)');
+title(sprintf('PC1 top frames: mean of the %d frames\nwith the highest PC1 projection', nTop));
+nexttile; imagesc(M.botMean(:, :, 1), lim); axis image off; colormap(gca, gray); cb = colorbar; ylabel(cb, 'mean F (a.u.)');
+title(sprintf('PC1 bottom frames: mean of the %d frames\nwith the lowest PC1 projection', nTop));
+nexttile; d = M.topMean(:, :, 1) - M.botMean(:, :, 1);
+imagesc(d, max(abs(d(:))) * [-1 1]); axis image off; colormap(gca, bwr()); cb = colorbar; ylabel(cb, '\DeltaF (a.u.)');
+title({'top - bottom', 'edge dipoles = motion; blobs = activity / z'});
+nexttile; plot(M.regDX, '.-', 'MarkerSize', 12); hold on; yline(0.5, 'k--');
+legend({'rigid', 'mean NR', 'max NR', 'mean(rigid+NR)', '0.5 px criterion'}, 'Location', 'northeast', 'Box', 'off');
+xlabel('PC #'); ylabel('offset between top and bottom means (px)'); box off
+title(sprintf('Registration offsets (Suite2p metric); max over PCs of mean(rigid+NR) = %.2f px', max(M.regDX(:, 4))));
+nexttile([1 2]); plot(M.frameIdx, M.tPC(:, 1), 'k'); hold on; segLines(gca, segBreaks);
+xlabel('frame of the concatenated movie'); ylabel('PC1 projection (a.u.)'); xlim([1 N]); box off
+title('PC1 time course (sampled frames)');
+title(tl, [ttl ' - PC1 of the motion-corrected movie'], 'FontWeight', 'bold');
+saveFig(f, fullfile(outDir, '02_PC1_corrected.png'));
+
+%% FIG 3: PC1 of every raw segment
+f = newfig([1500 330 * nSeg + 80]);
+tl = tiledlayout(nSeg, 4, 'TileSpacing', 'compact', 'Padding', 'compact');
+for i = 1:nSeg
+    lim = prctile1([Seg(i).topMean(:); Seg(i).botMean(:)], [1 99.7]);
+    nexttile; imagesc(Seg(i).topMean, lim); axis image off; colormap(gca, gray);
+    title({strrep(Seg(i).name, '_', '\_'), 'PC1 top frames mean (raw)'});
+    nexttile; imagesc(Seg(i).botMean, lim); axis image off; colormap(gca, gray);
+    title({sprintf('%d frames', Seg(i).T), 'PC1 bottom frames mean (raw)'});
+    nexttile; d = Seg(i).topMean - Seg(i).botMean;
+    imagesc(d, max(abs(d(:))) * [-1 1]); axis image off; colormap(gca, bwr()); cb = colorbar; ylabel(cb, '\DeltaF (a.u.)');
+    title({sprintf('top - bottom, rigid offset %.2f px', Seg(i).regDX(1, 1)), 'raw: no motion correction'});
+    nexttile; plot(Seg(i).frameIdx, Seg(i).pc1, 'k'); xlim([1 Seg(i).T]); box off
+    xlabel('frame within the segment'); ylabel('PC1 projection (a.u.)'); title('PC1 time course (raw)');
+end
+title(tl, [ttl ' - PC1 of each raw segment (read directly from the .sbx)'], 'FontWeight', 'bold');
+saveFig(f, fullfile(outDir, '03_PC1_raw_segments.png'));
+
+%% FIG 4: mean image raw vs corrected
+f = newfig([1500 520]);
+tl = tiledlayout(1, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
+lim = prctile1([M.meanImgRaw(:); M.meanImg(:)], [1 99.7]);
+nexttile; imagesc(M.meanImgRaw, lim); axis image off; colormap(gca, gray); cb = colorbar; ylabel(cb, 'mean F (a.u.)');
+title({'RAW mean image', lbl.rawNote, sprintf('sharpness %.4f (normalised gradient)', shp.raw)});
+nexttile; imagesc(M.meanImg, lim); axis image off; colormap(gca, gray); cb = colorbar; ylabel(cb, 'mean F (a.u.)');
+title({'CORRECTED mean image', sprintf('sharpness %.4f (x%.2f of raw)', shp.cor, shp.cor / shp.raw)});
+nexttile; d = M.meanImg - M.meanImgRaw;
+imagesc(d, max(abs(d(:))) * [-1 1]); axis image off; colormap(gca, bwr()); cb = colorbar; ylabel(cb, '\DeltaF (a.u.)');
+title({'corrected - raw', 'where motion correction moved signal'});
+title(tl, [ttl ' - mean image before and after motion correction (same pixels)'], 'FontWeight', 'bold');
+saveFig(f, fullfile(outDir, '04_mean_image_raw_vs_corrected.png'));
+
+%% FIG 5: zoomed patches
+sm = imgaussfilt(M.meanImg, 15);
+[gx, gy] = imgradientxy(M.meanImg / mean(M.meanImg(:)), 'central');
+en = imgaussfilt(hypot(gx, gy), 15) .* (sm > median(sm(:)));
+ploc = zeros(2, 2);                                    % [row col] centre of each patch
+[~, i1] = max(sm(:));     [ploc(1, 1), ploc(1, 2)] = ind2sub(size(sm), i1);
+[~, i2] = max(en(:));     [ploc(2, 1), ploc(2, 2)] = ind2sub(size(en), i2);
+pname = {'brightest region', 'most structured region (strongest edges)'};
+zs = min(o.zoomSize, min(size(M.meanImg)));
+f = newfig([1100 1050]);
+tl = tiledlayout(2, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+o4 = double(S.crop.out);
+for p = 1:2
+    r0 = min(max(round(ploc(p, 1) - zs/2), 1), size(M.meanImg, 1) - zs + 1);
+    c0 = min(max(round(ploc(p, 2) - zs/2), 1), size(M.meanImg, 2) - zs + 1);
+    rr = r0:r0+zs-1; cc = c0:c0+zs-1;
+    A = M.meanImgRaw(rr, cc); Bz = M.meanImg(rr, cc);
+    lim = prctile1([A(:); Bz(:)], [1 99.7]);
+    loc = sprintf('raw-frame rows %d-%d, cols %d-%d', o4(1)+r0-1, o4(1)+r0+zs-2, o4(2)+c0-1, o4(2)+c0+zs-2);
+    nexttile; imagesc(A, lim); axis image off; colormap(gca, gray);
+    title({sprintf('RAW, %s', pname{p}), sprintf('%s; sharpness %.4f', loc, sharpness(A))});
+    nexttile; imagesc(Bz, lim); axis image off; colormap(gca, gray);
+    title({sprintf('CORRECTED, %s', pname{p}), sprintf('same pixels; sharpness %.4f (x%.2f)', sharpness(Bz), sharpness(Bz) / sharpness(A))});
+end
+title(tl, {[ttl ' - zoomed mean image (zig-zag edges = scan-line offset; smear = residual motion)'], ...
+    lbl.rawNote}, 'FontWeight', 'bold');
+saveFig(f, fullfile(outDir, '05_zoom_raw_vs_corrected.png'));
+
+%% FIG 6: bidirectional scan phase
+if isstruct(S.bidi)
+    B = S.bidi;
+    f = newfig([1400 480]);
+    tl = tiledlayout(1, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
+    nexttile; hold on
+    plot(B.lags, B.cc, 'o-', 'Color', cRaw, 'LineWidth', 1.2);
+    leg = {sprintf('before correction (peak at %+.2f px)', B.lag)};
+    if ~isempty(B.ccAfter)
+        plot(B.lags, B.ccAfter, 's-', 'Color', 'k', 'LineWidth', 1.2);
+        leg{end+1} = sprintf('after correction (peak at %+.2f px)', B.lagAfter);
+    end
+    xline(0, ':'); legend(leg, 'Location', 'south', 'Box', 'off');
+    xlabel('lag of odd rows relative to even rows (px)'); ylabel('row-pair correlation'); box off
+    title('Even/odd scan-line correlation vs lag');
+    nexttile; hold on
+    ctr = mean(B.bandCols, 2);
+    bw = bar(ctr, [B.lagBands(:), B.lagBandsAfter(:)], 'grouped');
+    bw(1).FaceColor = cRaw; bw(2).FaceColor = [0.2 0.2 0.2];
+    legend({'before', 'after correction'}, 'Location', 'best', 'Box', 'off');
+    xlabel('column of the raw frame (band centre, px)'); ylabel('even/odd offset (px)'); box off
+    title('Offset per column band (differences = a single shift under-corrects)');
+    nexttile; axis off
+    txt = {sprintf('mode: %s', B.mode), ...
+        sprintf('estimate (before): %+.2f px   [per-frame median %+.2f, MAD %.2f, n = %d frames]', ...
+            B.lag, B.lagMedian, B.lagMAD, B.nFrames), ...
+        sprintf('applied: odd rows %+.2f px, even rows %+.2f px', B.applied(1), B.applied(2)), ...
+        sprintf('residual (after): %+.2f px', B.lagAfter), ...
+        sprintf('peak correlation %.2f, reliable = %d', B.peakCorr, B.reliable), '', ...
+        'lag > 0: features of odd raw rows lie right of the', ...
+        'same features in even rows; applied shift = [-lag/2, +lag/2].'};
+    text(0, 1, txt, 'VerticalAlignment', 'top', 'FontSize', 11, 'Interpreter', 'none');
+    title(tl, [ttl ' - bidirectional scan-phase offset'], 'FontWeight', 'bold');
+    saveFig(f, fullfile(outDir, '06_bidi_scan_phase.png'));
+end
+
+%% FIG 7: early vs late
+f = newfig([1600 800]);
+tl = tiledlayout(2, 4, 'TileSpacing', 'compact', 'Padding', 'compact');
+rows = {'raw', 'RAW'; 'cor', 'CORRECTED'};
+lim = prctile1([el.raw.first(:); el.raw.last(:); el.cor.first(:); el.cor.last(:)], [1 99.7]);
+for r = 1:2
+    E = el.(rows{r, 1});
+    nexttile((r - 1) * 4 + 1); imagesc(E.first, lim); axis image off; colormap(gca, gray);
+    title({sprintf('%s: first time bin', rows{r, 2}), sprintf('frames 1-%d', round(N / o.nBins))});
+    nexttile((r - 1) * 4 + 2); imagesc(E.last, lim); axis image off; colormap(gca, gray);
+    title({sprintf('%s: last time bin', rows{r, 2}), sprintf('frames %d-%d', N - round(N / o.nBins) + 1, N)});
+    nexttile((r - 1) * 4 + 3); imagesc(E.diff, max(abs(E.diff(:))) * [-1 1]); axis image off; colormap(gca, bwr()); cb = colorbar;
+    ylabel(cb, '\DeltaF (a.u.)');
+    title({sprintf('%s: last - first', rows{r, 2}), ...
+        sprintf('shift dy %+.2f dx %+.2f px; corr(diff, mean) %+.2f; corr(diff, gradient) %.2f', ...
+            E.dy, E.dx, E.corrGain, E.corrShift)}, 'FontSize', 9);
+end
+nexttile(4); hold on
+plot(1:o.nBins, el.raw.sharpPerBin, 'o-', 'Color', cRaw);
+plot(1:o.nBins, el.cor.sharpPerBin, 'o-', 'Color', 'k');
+legend({'raw', 'corrected'}, 'Location', 'best', 'Box', 'off');
+xlabel('time bin'); ylabel('sharpness (norm. gradient)'); box off
+title('Mean-image sharpness per time bin');
+nexttile(8); imagesc(binCorr, [min(binCorr(:)) 1]); axis image; colorbar; colormap(gca, parula);
+xlabel('time bin'); ylabel('time bin'); title('Corrected: bin-to-bin image correlation');
+title(tl, [ttl ' - first vs last time bin (corr(diff, mean) high = gain; corr(diff, gradient) high = shift)'], ...
+    'FontWeight', 'bold');
+saveFig(f, fullfile(outDir, '07_early_vs_late.png'));
+
+%% FIG 8: kymographs
+K = M.kymo;
+f = newfig([1500 1000]);
+tl = tiledlayout(4, 4, 'TileSpacing', 'compact', 'Padding', 'compact');
+nexttile(1, [4 1]); imagesc(M.meanImg); axis image off; colormap(gca, gray); hold on
+hh = (K.width - 1) / 2;
+[ly, lx] = size(M.meanImg);
+patch([0.5 lx+0.5 lx+0.5 0.5], K.row + [-hh -hh hh hh], 'c', 'FaceAlpha', 0.3, 'EdgeColor', 'c');
+patch(K.col + [-hh hh hh -hh], [0.5 0.5 ly+0.5 ly+0.5], 'm', 'FaceAlpha', 0.3, 'EdgeColor', 'm');
+title({'mean image', 'cyan = horizontal line, magenta = vertical line'});
+panels = {K.Hraw, K.tRaw, 'RAW, horizontal line (cyan)', 'x (px)'; ...
+          K.H, K.t, 'CORRECTED, horizontal line (cyan)', 'x (px)'; ...
+          K.Vraw, K.tRaw, 'RAW, vertical line (magenta)', 'y (px)'; ...
+          K.V, K.t, 'CORRECTED, vertical line (magenta)', 'y (px)'};
+for i = 1:4
+    nexttile((i - 1) * 4 + 2, [1 3]);
+    img = panels{i, 1}; t = panels{i, 2};
+    imagesc(t([1 end]), [1 size(img, 1)], img, prctile1(img(:), [1 99])); colormap(gca, gray); box off
+    ylabel(panels{i, 4}); title(sprintf('%s  (%d px band, %d-frame bins)', panels{i, 3}, K.width, K.binFrames));
+    if i == 4, xlabel('frame of the concatenated movie'); end
+    segLines(gca, segBreaks);
+end
+title(tl, [ttl ' - kymographs (straight stripes = stable; bending = motion; fading = z)'], 'FontWeight', 'bold');
+saveFig(f, fullfile(outDir, '08_kymographs.png'));
+
+%% summary
+perSeg = cell(nSeg, 1);
+for i = 1:nSeg
+    rng = S.frameIndex(:, 1) == i;
+    perSeg{i} = sprintf('  %-28s %6d frames  dy %+6.2f +- %.2f   dx %+6.2f +- %.2f   raw PC1 rigid offset %.2f px', ...
+        segNames{i}, Seg(i).T, mean(S.dy(rng)), std(S.dy(rng)), mean(S.dx(rng)), std(S.dx(rng)), Seg(i).regDX(1, 1));
+end
+lines = [{sprintf('Motion-correction diagnostics: %s', o.name), ...
+    sprintf('  %d frames, %d segment(s); output pixels %d x %d (raw-frame rect [%s])', N, nSeg, ...
+        size(M.meanImg, 1), size(M.meanImg, 2), num2str(double(S.crop.out))), ...
+    '', 'Rigid shifts per segment (mean +- SD, px):'}, perSeg(:)', {'', ...
+    sprintf('Rigid shift SD: dy %.2f px, dx %.2f px; outlier frames %.2f %%', std(S.dy), std(S.dx), 100 * mean(S.bad)), ...
+    sprintf('PC registration offset, max over PCs of mean(rigid+NR): %.3f px (criterion 0.5)', max(M.regDX(:, 4))), ...
+    sprintf('Frame-to-%s correlation: raw median %.3f (1st pct %.3f); corrected median %.3f (1st pct %.3f)', ...
+        lbl.ref, fcRaw(1), fcRaw(2), fcCor(1), fcCor(2)), ...
+    sprintf('Raw definition: %s', lbl.rawNote), ...
+    sprintf('Mean F, last / first time bin: raw %.3f, corrected %.3f', ...
+        mean(M.meanFRaw(end-numel(b1)+1:end)) / F0raw, mean(M.meanF(end-numel(b1)+1:end)) / F0), ...
+    sprintf('Mean-image sharpness: raw %.4f, corrected %.4f (x%.2f)', shp.raw, shp.cor, shp.cor / shp.raw), ...
+    sprintf('First vs last bin (corrected): shift dy %+.2f dx %+.2f px; corr(diff, mean) %+.2f; corr(diff, gradient) %.2f', ...
+        el.cor.dy, el.cor.dx, el.cor.corrGain, el.cor.corrShift)}];
+if isstruct(S.bidi)
+    lines{end+1} = sprintf('Scan phase (even/odd rows): estimate %+.2f px, applied [%+.2f %+.2f], residual %+.2f px (mode %s)', ...
+        S.bidi.lag, S.bidi.applied(1), S.bidi.applied(2), S.bidi.lagAfter, S.bidi.mode);
+else
+    lines{end+1} = 'Scan phase: no record in the _shifts.mat (motion correction made without bidiShift)';
+end
+fid = fopen(fullfile(outDir, 'mc_diagnostics_summary.txt'), 'w');
+fprintf(fid, '%s\n', lines{:});
+fclose(fid);
+fprintf('%s\n', lines{:});
+
+D = struct('name', o.name, 'nFrames', N, 'segments', {segNames}, 'regDXmax', max(M.regDX(:, 4)), ...
+    'dySD', std(S.dy), 'dxSD', std(S.dx), 'frameCorrRaw', fcRaw, 'frameCorrCorrected', fcCor, ...
+    'sharpnessRaw', shp.raw, 'sharpnessCorrected', shp.cor, 'earlyLate', rmfield(el.cor, {'first', 'last', 'diff'}), ...
+    'bidi', S.bidi);
+M.topMean = M.topMean(:, :, 1);                 % keep only PC1 images in the .mat
+M.botMean = M.botMean(:, :, 1);
+save(fullfile(outDir, 'mc_diagnostics.mat'), 'D', 'M', 'Seg', 'el', 'binCorr');
+end
+
+% ---------------------------------------------------------------------
+function [M, Seg, S, segNames, lbl] = fromFiles(mcPath, sbxFiles, o)
+% Metrics by reading the corrected tif and the raw .sbx files.
+sbxFiles = cellstr(sbxFiles);
+nSeg = numel(sbxFiles);
+[mcDir, mcName] = fileparts(mcPath);
+shiftsPath = fullfile(mcDir, [mcName '_shifts.mat']);
+need = {'dy', 'dx', 'cmax', 'bad', 'nonrigid', 'frameIndex', 'crop', 'outRows', 'outCols', 'params', 'bidi'};
+have = who('-file', shiftsPath);
+S = load(shiftsPath, need{ismember(need, have)});
+for f = need
+    if ~isfield(S, f{1}), S.(f{1}) = []; end
+end
+if isempty(S.crop) || isempty(S.outRows)
+    error('%s has no crop / outRows; rerun the motion correction.', shiftsPath);
+end
+first = 1;
+if isstruct(S.params) && isfield(S.params, 'dropFirstFrame')
+    first = double(S.params.dropFirstFrame);
+end
+mk = @(files) struct('sbx', {files}, 'channel', o.channel, 'crop', double(S.crop.raw(:)'), ...
+    'first', first, 'bidi', [0 0], 'rows', S.outRows, 'cols', S.outCols);
+segNames = cellfun(@(f) regexprep(f, '.*[\\/]|\.sbx$', ''), sbxFiles, 'UniformOutput', false);
+
+fprintf('mc_diagnostics: %s\n  corrected movie ...\n', o.name);
+M = registration_metrics(mcPath, 'rawMov', mk(sbxFiles), 'rawPC', false, 'nPC', o.nPC, ...
+    'nSample', o.nSample, 'streamStride', o.stride, 'nBins', o.nBins, 'plot', false);
+M.kymo.binFrames = M.kymo.bin * o.stride;
+
+% PC metric on every raw segment (read from the .sbx)
+Seg = repmat(struct('name', '', 'T', 0, 'frameIdx', [], 'pc1', [], 'topMean', [], 'botMean', [], ...
+    'regDX', [], 'meanF', [], 'streamIdx', [], 'frameCorr', []), 1, nSeg);
+for i = 1:nSeg
+    fprintf('  raw segment %d/%d (%s) ...\n', i, nSeg, segNames{i});
+    Mi = registration_metrics(mk(sbxFiles(i)), 'nPC', o.segNPC, 'nSample', min(o.nSample, 1500), ...
+        'streamStride', o.stride, 'nBins', 0, 'plot', false);
+    Seg(i) = struct('name', segNames{i}, 'T', Mi.movSize(3), 'frameIdx', Mi.frameIdx, ...
+        'pc1', Mi.tPC(:, 1), 'topMean', Mi.topMean(:, :, 1), 'botMean', Mi.botMean(:, :, 1), ...
+        'regDX', Mi.regDX, 'meanF', Mi.meanF, 'streamIdx', Mi.streamIdx, 'frameCorr', Mi.frameCorr);
+end
+lbl = struct('rawNote', 'raw = no motion or scan-phase correction', 'ref', 'mean image');
+end
+
+function [M, Seg, S, segNames, lbl] = fromData(d, o)
+% Metrics from variables kept in memory by sbx_motion_correct: per-frame
+% statistics are taken as given, PCA / PC1 maps are computed on the sampled
+% frames (the same registration_metrics code as the path mode).
+S = d.shifts;
+for f = {'dy', 'dx', 'cmax', 'bad', 'nonrigid', 'frameIndex', 'crop', 'outRows', 'outCols', 'params', 'bidi'}
+    if ~isfield(S, f{1}), S.(f{1}) = []; end
+end
+ns = size(d.corSample, 3);
+N = numel(d.meanF.cor);
+sIdx = double(d.sampleIdx(:));
+fprintf('mc_diagnostics: %s (from variables, %d sampled frames of %d)\n', o.name, ns, N);
+M = registration_metrics(d.corSample, 'rawMov', d.rawSample, 'rawPC', false, 'nPC', o.nPC, ...
+    'nSample', ns, 'streamStride', 1, 'nBins', 0, 'plot', false);
+M.frameIdx = sIdx(M.frameIdx);                       % array positions -> frame numbers
+M.streamIdx = (1:N)';
+M.streamIdxRaw = (1:N)';
+M.meanF = d.meanF.cor(:);
+M.meanFRaw = d.meanF.raw(:);
+M.frameCorr = d.frameCorr.cor(:);
+M.frameCorrRaw = d.frameCorr.raw(:);
+M.binImg = d.binImg.cor;
+M.binImgRaw = d.binImg.raw;
+M.movSize = [M.movSize(1:2) N];
+M.kymo.t = interp1(1:ns, sIdx, M.kymo.t, 'linear', 'extrap');      % bin centres in frames
+M.kymo.tRaw = interp1(1:ns, sIdx, M.kymo.tRaw, 'linear', 'extrap');
+M.kymo.binFrames = round(M.kymo.bin * N / ns);
+
+% PC1 of every raw segment, from the sampled raw frames of that segment
+segNames = cellstr(d.segNames);
+nSeg = numel(segNames);
+first = 1;
+if isstruct(S.params) && isfield(S.params, 'dropFirstFrame')
+    first = double(S.params.dropFirstFrame);
+end
+fi = S.frameIndex;
+file = fi(sIdx, 1);
+within = fi(sIdx, 2) - first + 1;                    % frame number within the segment
+Seg = repmat(struct('name', '', 'T', 0, 'frameIdx', [], 'pc1', [], 'topMean', [], 'botMean', [], ...
+    'regDX', [], 'meanF', [], 'streamIdx', [], 'frameCorr', []), 1, nSeg);
+for i = 1:nSeg
+    fprintf('  raw segment %d/%d (%s) ...\n', i, nSeg, segNames{i});
+    sel = find(file == i);
+    inSeg = find(fi(:, 1) == i);
+    Mi = registration_metrics(d.rawSample(:, :, sel), 'nPC', o.segNPC, 'nSample', numel(sel), ...
+        'streamStride', 1, 'nBins', 0, 'plot', false);
+    Seg(i) = struct('name', segNames{i}, 'T', numel(inSeg), 'frameIdx', within(sel(Mi.frameIdx)), ...
+        'pc1', Mi.tPC(:, 1), 'topMean', Mi.topMean(:, :, 1), 'botMean', Mi.botMean(:, :, 1), ...
+        'regDX', Mi.regDX, 'meanF', d.meanF.raw(inSeg), 'streamIdx', (1:numel(inSeg))', ...
+        'frameCorr', d.frameCorr.raw(inSeg));
+end
+note = 'raw = scan-phase corrected, no motion correction';
+if isfield(d, 'rawNote') && ~isempty(d.rawNote), note = d.rawNote; end
+ref = 'template';
+if isfield(d, 'corrRef') && ~isempty(d.corrRef), ref = d.corrRef; end
+lbl = struct('rawNote', note, 'ref', ref);
+end
+
+function f = newfig(sz)
+f = figure('Visible', 'off', 'Color', 'w', 'Position', [50 50 sz]);
+end
+
+function saveFig(f, path)
+try
+    exportgraphics(f, path, 'Resolution', 150);
+catch
+    saveas(f, path);
+end
+close(f);
+end
+
+function segLines(ax, breaks)
+for b = reshape(breaks, 1, [])
+    xline(ax, b - 0.5, '--', 'Color', [0.5 0.5 0.5]);
+end
+end
+
+function s = sharpness(img)
+% mean gradient magnitude of the mean-normalised image (compare between
+% images of the same pixels only)
+img = double(img) / mean(double(img(:)));
+[gx, gy] = imgradientxy(img, 'central');
+s = mean(sqrt(gx(:).^2 + gy(:).^2));
+end
+
+function v = prctile1(x, q)
+x = sort(double(x(:)));
+x = x(~isnan(x));
+v = interp1(linspace(0, 100, numel(x)), x, q);
+if numel(v) == 2 && v(1) == v(2), v = v(1) + [-1 1]; end
+end
+
+function c = bwr()
+n = 128; a = linspace(0, 1, n)';
+c = [[a a ones(n, 1)]; [ones(n, 1) flipud(a) flipud(a)]];
+end

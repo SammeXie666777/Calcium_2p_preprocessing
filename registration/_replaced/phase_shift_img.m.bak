@@ -1,0 +1,34 @@
+function [dy, dx, peak] = phase_shift_img(ref, img)
+% PHASE_SHIFT_IMG  Rigid translation between two images by phase correlation
+% (Hann-tapered, sub-pixel by a parabola through the peak).
+%
+%   [dy, dx, peak] = phase_shift_img(ref, img)
+%
+% (dy, dx) = shift of the content of img relative to ref, in px: img(y,x) ~
+% ref(y - dy, x - dx). peak = height of the correlation peak (0..1, higher =
+% more reliable). Same-size 2-D inputs; NaNs are treated as 0.
+
+ref = double(ref);
+img = double(img);
+ref(isnan(ref)) = 0;
+img(isnan(img)) = 0;
+[h, w] = size(ref);
+tap = (0.5 - 0.5 * cos(2*pi*(0:h-1)' / max(h-1, 1))) * (0.5 - 0.5 * cos(2*pi*(0:w-1) / max(w-1, 1)));
+a = (ref - mean(ref(:))) .* tap;
+b = (img - mean(img(:))) .* tap;
+R = fft2(b) .* conj(fft2(a));
+R = R ./ max(abs(R), eps);
+cc = fftshift(real(ifft2(R)));
+[peak, i] = max(cc(:));
+[py, px] = ind2sub(size(cc), i);
+dy = py - (floor(h/2) + 1);
+dx = px - (floor(w/2) + 1);
+if py > 1 && py < h
+    d = cc(py-1, px) - 2*cc(py, px) + cc(py+1, px);
+    if d < 0, dy = dy + 0.5 * (cc(py-1, px) - cc(py+1, px)) / d; end
+end
+if px > 1 && px < w
+    d = cc(py, px-1) - 2*cc(py, px) + cc(py, px+1);
+    if d < 0, dx = dx + 0.5 * (cc(py, px-1) - cc(py, px+1)) / d; end
+end
+end

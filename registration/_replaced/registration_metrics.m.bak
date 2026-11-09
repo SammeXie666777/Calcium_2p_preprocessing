@@ -61,6 +61,19 @@ function M = registration_metrics(mov, varargin)
 %              the lines
 %   maxFrames  use only the first maxFrames frames of each movie
 %   chunk      frames per read in the streaming pass
+%   nSample    frames for the PCA sample ([] = 2000 or 5000 as described above)
+%   streamStride  streaming pass (frame correlation, mean F, kymographs, time
+%              bins) uses every Nth frame (1 = all)
+%   nBins      >0: also mean images of nBins consecutive time bins
+%              (M.binImg), e.g. for first-vs-last comparisons
+%
+% A movie / rawMov may also be a Scanbox recording read directly, no tif:
+%   struct('sbx', <path or cell of paths, concatenated in order>, ...
+%          'channel', 1, 'crop', [1 80 Inf Inf], 'first', 1, 'bidi', [0 0], ...
+%          'rows', [], 'cols', [])
+% 'first' = frames dropped at the start of every file (1 = as
+% sbx_motion_correct), 'rows'/'cols' select pixels of the cropped frame
+% (e.g. S.outRows / S.outCols of the _shifts.mat to match the corrected movie).
 %
 % Output struct M:
 %   regDX     nPC x 4  [rigid, meanNR, maxNR, mean(rigid+NR)] offset lengths (px)
@@ -69,7 +82,10 @@ function M = registration_metrics(mov, varargin)
 %   botMean   ly x lx x nPC   mean of bottom frames per PC
 %   frameIdx  indices of sampled frames
 %   meanImg   mean image of the cropped movie (mean of the sampled frames)
-%   frameCorr T x 1  correlation of each frame with meanImg
+%   frameCorr nStream x 1  correlation of each streamed frame with meanImg
+%   streamIdx frame numbers of the streamed frames (1:streamStride:T)
+%   meanF     nStream x 1  mean fluorescence of each streamed frame (cropped)
+%   binImg    ly x lx x nBins mean image per time bin ([] if nBins = 0)
 %   movSize   [Ly Lx T] of mov (after maxFrames)
 %   frameCorrRaw, meanImgRaw, rawSize   same for rawMov ([] if not given)
 %   regDXRaw, tPCRaw, topMeanRaw, botMeanRaw, frameIdxRaw   PC metric of
@@ -98,6 +114,9 @@ p.addParameter('kymoBin', 5);
 p.addParameter('hpSigma', 10);
 p.addParameter('maxFrames', Inf);
 p.addParameter('chunk', 200);
+p.addParameter('nSample', []);
+p.addParameter('streamStride', 1);
+p.addParameter('nBins', 0);
 p.parse(varargin{:});
 o = p.Results;
 rawMov = o.rawMov;
@@ -123,7 +142,7 @@ xr = o.xrange(1):o.xrange(2);
 [ly, lx] = deal(numel(yr), numel(xr));
 
 % ---- 1-5. PC metric on the sampled frames (sample mean = mean image)
-frameIdx = sample_index(T, Ly, Lx);
+frameIdx = sample_index(T, Ly, Lx, o.nSample);
 fprintf('  reading %d sample frames ...\n', numel(frameIdx));
 X = read_frames(src, frameIdx, yr, xr);
 meanImg = mean_image(X);
@@ -133,7 +152,7 @@ clear X
 [frameCorrRaw, meanImgRaw, frameIdxRaw] = deal([]);
 [regDXRaw, tPCRaw, topMeanRaw, botMeanRaw] = deal([]);
 if ~isempty(raw)
-    frameIdxRaw = sample_index(raw.T, Ly, Lx);
+    frameIdxRaw = sample_index(raw.T, Ly, Lx, o.nSample);
     fprintf('  reading %d raw sample frames ...\n', numel(frameIdxRaw));
     Xr = read_frames(raw, frameIdxRaw, yr, xr);
     meanImgRaw = mean_image(Xr);
@@ -155,15 +174,20 @@ kRow = min(max(round(kRow), 1 + h), ly - h);
 kCol = min(max(round(kCol), 1 + h), lx - h);
 
 % ---- 6-7. streaming pass: frame-to-mean correlation and line profiles
-fprintf('  streaming %d frames ...\n', T);
-[frameCorr, H, V] = stream_pass(src, yr, xr, meanImg, kRow, kCol, h, o.chunk);
+fprintf('  streaming %d frames (every %d) ...\n', T, o.streamStride);
+[frameCorr, H, V, meanF, streamIdx, binImg] = stream_pass(src, yr, xr, meanImg, kRow, kCol, h, ...
+    o.chunk, o.streamStride, o.nBins);
 kymo = struct('row', kRow, 'col', kCol, 'width', 2*h + 1, 'bin', o.kymoBin);
 [kymo.H, kymo.V, kymo.t] = bin_profiles(H, V, o.kymoBin);
+kymo.t = streamIdx(1) + (kymo.t - 1) * o.streamStride;      % bin centres in frame numbers
 [kymo.Hraw, kymo.Vraw, kymo.tRaw] = deal([]);
+[meanFRaw, streamIdxRaw, binImgRaw] = deal([]);
 if ~isempty(raw)
-    fprintf('  streaming %d raw frames ...\n', raw.T);
-    [frameCorrRaw, H, V] = stream_pass(raw, yr, xr, meanImgRaw, kRow, kCol, h, o.chunk);
+    fprintf('  streaming %d raw frames (every %d) ...\n', raw.T, o.streamStride);
+    [frameCorrRaw, H, V, meanFRaw, streamIdxRaw, binImgRaw] = stream_pass(raw, yr, xr, meanImgRaw, ...
+        kRow, kCol, h, o.chunk, o.streamStride, o.nBins);
     [kymo.Hraw, kymo.Vraw, kymo.tRaw] = bin_profiles(H, V, o.kymoBin);
+    kymo.tRaw = streamIdxRaw(1) + (kymo.tRaw - 1) * o.streamStride;
 end
 clear H V
 
@@ -175,6 +199,8 @@ M = struct('regDX', regDX, 'tPC', tPC, 'topMean', topMean, ...
            'frameCorrRaw', frameCorrRaw, 'meanImgRaw', meanImgRaw, 'rawSize', rawSize, ...
            'regDXRaw', regDXRaw, 'tPCRaw', tPCRaw, 'topMeanRaw', topMeanRaw, ...
            'botMeanRaw', botMeanRaw, 'frameIdxRaw', frameIdxRaw, ...
+           'streamIdx', streamIdx, 'meanF', meanF, 'binImg', binImg, ...
+           'streamIdxRaw', streamIdxRaw, 'meanFRaw', meanFRaw, 'binImgRaw', binImgRaw, ...
            'kymo', kymo, 'opts', o);
 
 if o.plot
@@ -190,7 +216,7 @@ function src = open_source(m, maxFrames, label)
 % 'cols', ...). Fields: kind ('array' / 'tif'), data or path, rows, cols
 % (pixels of the stored frame that are used), Ly, Lx, T, cls.
 src = struct('kind', 'array', 'data', [], 'path', '', 'rows', [], 'cols', [], ...
-             'Ly', 0, 'Lx', 0, 'T', 0, 'cls', '');
+             'Ly', 0, 'Lx', 0, 'T', 0, 'cls', '', 'sbx', []);
 if isnumeric(m) || islogical(m)
     src.data = m;
     [H, W, n] = size(m);
@@ -199,14 +225,41 @@ else
     if ischar(m) || isstring(m)
         m = struct('path', char(m));
     end
-    if ~isstruct(m) || ~isfield(m, 'path') || ~isfile(m.path)
-        error('%s: give an array, an existing tif path, or a struct with a ''path'' field.', label);
+    if isstruct(m) && isfield(m, 'sbx')
+        % Scanbox recording(s) read directly; several files are concatenated
+        % in the order given, 'first' frames dropped from each (1 = as
+        % sbx_motion_correct)
+        src.kind = 'sbx';
+        files = cellstr(m.sbx);
+        s = struct('channel', 1, 'crop', [1 80 Inf Inf], 'first', 1, 'bidi', [0 0]);
+        for f = fieldnames(s)'
+            if isfield(m, f{1}) && ~isempty(m.(f{1}))
+                s.(f{1}) = m.(f{1});
+            end
+        end
+        info = cellfun(@sbx_file_info, files, 'UniformOutput', false);
+        s.info = [info{:}];
+        crop = double(s.crop(:)');
+        s.rc = [max(crop(1:2), 1), min(crop(3:4), [s.info(1).rows s.info(1).cols])];
+        nUse = max([s.info.nFramesDisk] - s.first, 0);
+        s.cum = [0 cumsum(nUse)];
+        src.sbx = s;
+        if isfield(m, 'rows'), src.rows = m.rows(:)'; end
+        if isfield(m, 'cols'), src.cols = m.cols(:)'; end
+        H = s.rc(3) - s.rc(1) + 1;
+        W = s.rc(4) - s.rc(2) + 1;
+        n = s.cum(end);
+        src.cls = 'uint16';
+    else
+        if ~isstruct(m) || ~isfield(m, 'path') || ~isfile(m.path)
+            error('%s: give an array, an existing tif path, an sbx struct, or a struct with a ''path'' field.', label);
+        end
+        src.kind = 'tif';
+        src.path = char(m.path);
+        if isfield(m, 'rows'), src.rows = m.rows(:)'; end
+        if isfield(m, 'cols'), src.cols = m.cols(:)'; end
+        [H, W, n, src.cls] = tif_info(src.path, maxFrames);
     end
-    src.kind = 'tif';
-    src.path = char(m.path);
-    if isfield(m, 'rows'), src.rows = m.rows(:)'; end
-    if isfield(m, 'cols'), src.cols = m.cols(:)'; end
-    [H, W, n, src.cls] = tif_info(src.path, maxFrames);
 end
 if isempty(src.rows), src.rows = 1:H; end
 if isempty(src.cols), src.cols = 1:W; end
@@ -244,14 +297,33 @@ t.close();
 warning(w);
 end
 
-function idx = sample_index(T, Ly, Lx)
-% Frames for the PC metric: 2000 if large frame or short movie, else 5000.
-if max(Ly, Lx) > 700 || T < 5000
+function idx = sample_index(T, Ly, Lx, nSample)
+% Frames for the PC metric: nSample if given, else 2000 if large frame or
+% short movie, else 5000.
+if nargin >= 4 && ~isempty(nSample)
+    nSamp = min(nSample, T);
+elseif max(Ly, Lx) > 700 || T < 5000
     nSamp = min(2000, T);
 else
     nSamp = 5000;
 end
 idx = unique(round(linspace(1, T, nSamp)));
+end
+
+function F = sbx_src_read(src, gidx)
+% Cropped frames (full stored frame, uint16) with global (concatenated)
+% 1-based indices gidx, ascending, of an 'sbx' source.
+s = src.sbx;
+F = zeros(s.rc(3)-s.rc(1)+1, s.rc(4)-s.rc(2)+1, numel(gidx), 'uint16');
+for f = 1:numel(s.info)
+    sel = find(gidx > s.cum(f) & gidx <= s.cum(f+1));
+    if isempty(sel)
+        continue
+    end
+    f0 = s.first + gidx(sel) - s.cum(f) - 1;              % 0-based frame on disk
+    F(:, :, sel) = sbx_read_frames(s.info(f).path, f0, 'channel', s.channel, ...
+        'crop', s.rc, 'bidi', s.bidi, 'info', s.info(f));
+end
 end
 
 function X = read_frames(src, idx, yr, xr)
@@ -261,6 +333,15 @@ R = src.rows(yr);
 C = src.cols(xr);
 if strcmp(src.kind, 'array')
     X = src.data(R, C, idx);
+    return
+end
+if strcmp(src.kind, 'sbx')
+    X = zeros(numel(R), numel(C), numel(idx), 'uint16');
+    for k0 = 1:200:numel(idx)
+        k = k0:min(k0 + 199, numel(idx));
+        F = sbx_src_read(src, idx(k));
+        X(:, :, k) = F(R, C, :);
+    end
     return
 end
 X = zeros(numel(R), numel(C), numel(idx), src.cls);
@@ -332,47 +413,74 @@ for k = 1:nPC
 end
 end
 
-function [r, H, V] = stream_pass(src, yr, xr, mimg, row, col, h, chunk)
-% One pass over all frames, chunk at a time: Pearson correlation of each
-% (cropped) frame with mimg, and the band-averaged profile along the
-% horizontal (H, lx x T) and vertical (V, ly x T) kymograph lines.
+function [r, H, V, meanF, fr, binImg] = stream_pass(src, yr, xr, mimg, row, col, h, chunk, stride, nBins)
+% One pass over frames fr = 1:stride:T, chunk at a time: Pearson correlation
+% of each (cropped) frame with mimg, the band-averaged profile along the
+% horizontal (H, lx x nS) and vertical (V, ly x nS) kymograph lines, the
+% mean fluorescence of each frame, and (nBins > 0) the mean image of each of
+% nBins consecutive time bins of the whole movie.
 T = src.T;
+fr = 1:stride:T;
+nS = numel(fr);
 R = src.rows(yr);
 C = src.cols(xr);
 [ly, lx] = deal(numel(R), numel(C));
 mz = mimg(:) - mean(mimg(:));
 mz = mz / norm(mz);
-r = zeros(T, 1);
-H = zeros(lx, T, 'single');
-V = zeros(ly, T, 'single');
+r = zeros(nS, 1);
+meanF = zeros(nS, 1);
+H = zeros(lx, nS, 'single');
+V = zeros(ly, nS, 'single');
+binSum = zeros(ly, lx, max(nBins, 1));
+binCnt = zeros(1, max(nBins, 1));
+binOf = min(max(nBins, 1), ceil(fr / T * max(nBins, 1)));
 isTif = strcmp(src.kind, 'tif');
 if isTif
     [t, cleanup] = open_tif(src.path); %#ok<ASGLU>
+    cur = 1;
 end
 nextReport = 0.1;
-for s = 1:chunk:T
-    f = s:min(s + chunk - 1, T);
-    if isTif
-        F = zeros(ly, lx, numel(f), src.cls);
-        for k = 1:numel(f)
-            if f(k) > 1
-                t.nextDirectory();
+for s = 1:chunk:nS
+    k = s:min(s + chunk - 1, nS);
+    f = fr(k);
+    switch src.kind
+        case 'tif'
+            F = zeros(ly, lx, numel(f), src.cls);
+            for i = 1:numel(f)
+                while cur < f(i)
+                    t.nextDirectory();
+                    cur = cur + 1;
+                end
+                I = t.read();
+                F(:, :, i) = I(R, C);
             end
-            I = t.read();
-            F(:,:,k) = I(R, C);
-        end
-    else
-        F = src.data(R, C, f);
+        case 'sbx'
+            F = sbx_src_read(src, f);
+            F = F(R, C, :);
+        otherwise
+            F = src.data(R, C, f);
     end
-    H(:, f) = reshape(mean(single(F(row-h:row+h, :, :)), 1), lx, []);
-    V(:, f) = reshape(mean(single(F(:, col-h:col+h, :)), 2), ly, []);
+    H(:, k) = reshape(mean(single(F(row-h:row+h, :, :)), 1), lx, []);
+    V(:, k) = reshape(mean(single(F(:, col-h:col+h, :)), 2), ly, []);
     D = double(reshape(F, [], numel(f)));
+    meanF(k) = mean(D, 1)';
+    if nBins > 0
+        for b = unique(binOf(k))
+            sel = binOf(k) == b;
+            binSum(:, :, b) = binSum(:, :, b) + sum(double(F(:, :, sel)), 3);
+            binCnt(b) = binCnt(b) + nnz(sel);
+        end
+    end
     D = D - mean(D, 1);
-    r(f) = (mz' * D) ./ sqrt(sum(D.^2, 1));
-    if f(end) / T >= nextReport
-        fprintf('    %3.0f%%\n', 100 * f(end) / T);
+    r(k) = (mz' * D) ./ sqrt(sum(D.^2, 1));
+    if k(end) / nS >= nextReport
+        fprintf('    %3.0f%%\n', 100 * k(end) / nS);
         nextReport = nextReport + 0.1;
     end
+end
+binImg = [];
+if nBins > 0
+    binImg = single(binSum ./ reshape(max(binCnt, 1), 1, 1, []));
 end
 end
 
@@ -515,9 +623,9 @@ hasRaw = ~isempty(M.frameCorrRaw);
 figure('Name', 'Frame-to-mean correlation', 'Color', 'w', 'Position', [100 100 1200 330]);
 subplot(1,4,1:3); hold on
 if hasRaw
-    plot(M.frameCorrRaw, 'Color', [0.85 0.33 0.10]);
+    plot(M.streamIdxRaw, M.frameCorrRaw, 'Color', [0.85 0.33 0.10]);
 end
-plot(M.frameCorr, 'k');
+plot(M.streamIdx, M.frameCorr, 'k');
 xlabel('frame'); ylabel('corr. with mean image'); box off
 ok = ~isnan(M.frameCorr);    % NaN = flat frame
 title(sprintf('median %.3f, 1st pct %.3f (corrected)', median(M.frameCorr(ok)), prctile1(M.frameCorr(ok))));

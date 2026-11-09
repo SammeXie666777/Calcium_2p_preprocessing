@@ -1,0 +1,15 @@
+function out = read_crop_out(tifPath)
+% READ_CROP_OUT  Output rectangle [row1 col1 row2 col2] (raw-frame pixels) of
+% a motion-corrected tif, from its _shifts.mat. [] if the file or the field is
+% missing (outputs made before it was saved).
+[d, n] = fileparts(tifPath);
+shiftsPath = fullfile(d, [n '_shifts.mat']);
+out = [];
+if ~isfile(shiftsPath) || ~ismember('crop', who('-file', shiftsPath))
+    return
+end
+S = load(shiftsPath, 'crop');
+if isstruct(S.crop) && isfield(S.crop, 'out')
+    out = double(S.crop.out(:)');
+end
+end

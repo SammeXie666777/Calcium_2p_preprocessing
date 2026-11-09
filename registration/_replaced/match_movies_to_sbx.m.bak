@@ -1,0 +1,42 @@
+function [iM, iS] = match_movies_to_sbx(nBeh, nSbx)
+% MATCH_MOVIES_TO_SBX  Pair behavior movies with .sbx segments when their
+% counts differ. Order is kept (no crossing), all of the shorter list is
+% paired, and the total |frame difference| is minimal (dynamic programming).
+%
+%   [iM, iS] = match_movies_to_sbx(nBeh, nSbx)   % frame counts of each
+%   movie iM(k) is paired with sbx segment iS(k).
+swap = numel(nBeh) > numel(nSbx);        % true: the sbx list is the shorter one
+if swap
+    a = nSbx; b = nBeh;
+else
+    a = nBeh; b = nSbx;
+end
+K = numel(a);
+L = numel(b);
+D = inf(K + 1, L + 1);                   % D(i+1,j+1): best cost of a(1:i) within b(1:j)
+D(1, :) = 0;
+for i = 1:K
+    for j = i:L
+        D(i+1, j+1) = min(D(i+1, j), D(i, j) + abs(a(i) - b(j)));
+    end
+end
+ib = zeros(1, K);                        % backtrack
+i = K;
+j = L;
+while i > 0
+    if j > i && D(i+1, j+1) == D(i+1, j)
+        j = j - 1;                       % b(j) left unpaired
+    else
+        ib(i) = j;
+        i = i - 1;
+        j = j - 1;
+    end
+end
+if swap
+    iM = ib;
+    iS = 1:K;
+else
+    iM = 1:K;
+    iS = ib;
+end
+end

@@ -1,0 +1,139 @@
+function S = segment_projections(sbxFiles, outPng, varargin)
+% SEGMENT_PROJECTIONS  Mean and max projection of every .sbx segment that
+% will be concatenated into one motion-corrected movie, read directly from
+% the .sbx (no tif), plus how each segment sits relative to segment 1.
+%
+%   S = segment_projections(sbxFiles, outPng)
+%   S = segment_projections(sbxFiles, outPng, 'channel', 1, 'crop', [1 80 Inf Inf], ...
+%                           'nSample', 1500, 'first', 1, 'title', 'session name')
+%
+%   sbxFiles  cell of .sbx paths (extension optional), in concatenation order
+%   outPng    figure file; a .mat with the images is saved next to it
+%   channel   PMT channel (1 = green)
+%   crop      raw-frame crop, as sbx_motion_correct
+%   nSample   frames per segment, evenly spaced (mean and max are over these;
+%             the max of a subsample is a lower bound of the true max)
+%   first     frames dropped at the start of every file (1, as the pipeline)
+%
+% Figure (one column per segment):
+%   row 1  mean projection, row 2  max projection (same colour scale across
+%   segments), row 3  overlay of segment 1 (magenta) with this segment
+%   (green): white = aligned, colour fringes = the segment sits elsewhere.
+%   Titles give the shift (dy, dx in px) of each segment's mean image
+%   relative to segment 1 by phase correlation. These are RAW images, before
+%   motion correction: a step between segments is what the concatenated
+%   correction has to absorb.
+%
+% S: names, nFramesDisk, nSampled, shiftVs1 [nSeg x 2] (dy dx), peak.
+
+ip = inputParser;
+ip.addParameter('channel', 1);
+ip.addParameter('crop', [1 80 Inf Inf]);
+ip.addParameter('nSample', 1500);
+ip.addParameter('first', 1);
+ip.addParameter('title', '');
+ip.parse(varargin{:});
+o = ip.Results;
+
+sbxFiles = cellstr(sbxFiles);
+nSeg = numel(sbxFiles);
+meanImg = cell(1, nSeg);
+maxImg = cell(1, nSeg);
+names = cell(1, nSeg);
+nDisk = zeros(1, nSeg);
+nSamp = zeros(1, nSeg);
+for i = 1:nSeg
+    info = sbx_file_info(sbxFiles{i});
+    [~, names{i}] = fileparts(info.path);
+    nDisk(i) = info.nFramesDisk;
+    avail = o.first:info.nFramesDisk - 1;
+    idx = unique(round(linspace(avail(1), avail(end), min(o.nSample, numel(avail)))));
+    nSamp(i) = numel(idx);
+    sumImg = 0;
+    mx = [];
+    for k0 = 1:200:numel(idx)
+        k = k0:min(k0 + 199, numel(idx));
+        Y = sbx_read_frames(info.path, idx(k), 'channel', o.channel, 'crop', o.crop, 'info', info);
+        sumImg = sumImg + sum(double(Y), 3);
+        if isempty(mx), mx = max(Y, [], 3); else, mx = max(mx, max(Y, [], 3)); end
+    end
+    meanImg{i} = single(sumImg / numel(idx));
+    maxImg{i} = mx;
+end
+
+% shift of every segment relative to segment 1
+shiftVs1 = zeros(nSeg, 2);
+peak = zeros(nSeg, 1);
+for i = 2:nSeg
+    [shiftVs1(i, 1), shiftVs1(i, 2), peak(i)] = phase_shift_img(meanImg{1}, meanImg{i});
+end
+
+% figure
+mlim = prctile1(cell2mat(cellfun(@(x) x(:), meanImg(:), 'UniformOutput', false)), [1 99.7]);
+xlim_ = prctile1(double(cell2mat(cellfun(@(x) x(:), maxImg(:), 'UniformOutput', false))), [1 99.7]);
+f = figure('Visible', 'off', 'Color', 'w', 'Position', [50 50 min(500 * nSeg + 150, 2400) 1000]);
+tl = tiledlayout(3, nSeg, 'TileSpacing', 'compact', 'Padding', 'compact');
+rowName = {'mean projection', 'max projection (sampled frames)', ...
+    'overlay: segment 1 (magenta) + this segment (green)'};
+m1 = rescale01(meanImg{1}, mlim);
+for i = 1:nSeg
+    nexttile(i);
+    imagesc(meanImg{i}, mlim); axis image off; colormap(gca, gray);
+    if i == 1
+        sh = 'reference segment';
+    else
+        sh = sprintf('shift vs seg 1: dy %+.2f, dx %+.2f px', shiftVs1(i, 1), shiftVs1(i, 2));
+    end
+    title({strrep(names{i}, '_', '\_'), sprintf('%d frames on disk, %d sampled', nDisk(i), nSamp(i)), sh}, ...
+        'FontSize', 9);
+    if i == 1, rowLabel(rowName{1}); end
+    nexttile(nSeg + i);
+    imagesc(double(maxImg{i}), xlim_); axis image off; colormap(gca, gray);
+    if i == 1, rowLabel(rowName{2}); end
+    nexttile(2 * nSeg + i);
+    if i == 1
+        imagesc(m1); axis image off; colormap(gca, gray);
+        title('(segment 1 alone)', 'FontSize', 9);
+    else
+        mk = rescale01(meanImg{i}, mlim);
+        image(cat(3, m1, mk, m1)); axis image off;
+    end
+    if i == 1, rowLabel(rowName{3}); end
+end
+if isempty(o.title)
+    [~, o.title] = fileparts(fileparts(sbxFiles{1}));
+end
+title(tl, sprintf('Raw segments to be concatenated: %s  (channel %d, before motion correction)', ...
+    strrep(o.title, '_', '\_'), o.channel), 'FontWeight', 'bold');
+save_fig(f, outPng);
+close(f);
+
+S = struct('names', {names}, 'nFramesDisk', nDisk, 'nSampled', nSamp, ...
+    'shiftVs1', shiftVs1, 'peak', peak);
+[d, n] = fileparts(outPng);
+save(fullfile(d, [n '.mat']), 'S', 'meanImg', 'maxImg');
+end
+
+function rowLabel(txt)
+% vertical label at the left of a tile (its axis is off)
+text(-0.04, 0.5, txt, 'Units', 'normalized', 'Rotation', 90, 'HorizontalAlignment', 'center', ...
+    'FontSize', 9, 'FontWeight', 'bold');
+end
+
+function x = rescale01(img, lim)
+x = min(max((double(img) - lim(1)) / max(lim(2) - lim(1), eps), 0), 1);
+end
+
+function v = prctile1(x, q)
+x = sort(double(x(:)));
+v = interp1(linspace(0, 100, numel(x)), x, q);
+if v(1) == v(2), v = v(1) + [-1 1]; end
+end
+
+function save_fig(f, path)
+try
+    exportgraphics(f, path, 'Resolution', 150);
+catch
+    saveas(f, path);
+end
+end

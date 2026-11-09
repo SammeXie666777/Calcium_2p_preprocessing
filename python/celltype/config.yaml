@@ -1,35 +1,28 @@
 # Cell-type classification pipeline (SPN vs non-SPN, then dSPN vs iSPN).
 # Run from Calcium_2p_preprocessing\python:
 #     python -m celltype.pipeline --config celltype\config.yaml --mode auto
-# Modes: extract | features | label | train | predict | auto
+# Modes: features | label | train | predict | auto
 
-# Session folders (<animal>\<date>\<exptype>_rec<rid>) or paths to the
-# ConcatenatedMovie_MC.tif inside them. Same file names as run_suite2p_on_MC.py.
 inputs:
-  # - 'Y:\mouse1\260930\lintrack_rec001'
+   - 'Y:\2p_animals\mouse1'
 inputs_file: null          # optional .txt with one session folder / movie per line
 
 # Session id = last 3 path parts (animal/date/rec); animal = first of these.
 # Cross-validation leaves one animal out, so this has to be right.
 session_id_depth: 3
 
-# ---------- Suite2p (forwarded to run_suite2p_on_MC.py) ----------
+# ---------- Imaging (analysis only; Suite2p is run separately) ----------
 suite2p:
-  fs: 31.25                 # frame rate of ConcatenatedMovie_MC.tif (Hz)
-  tau: 1.0                 # indicator decay (s): ~0.7 GCaMP6f, ~1.0-1.25 GCaMP6s
+  fs: 31.25                # frame rate of ConcatenatedMovie_MC.tif (Hz)
   diameter: 12             # expected soma diameter (px)
-  margin: 0
-  use_mc_bad_frames: true
-  chan2_threshold: 0.65
-  cellpose_chan2: false
-  overwrite: false         # true: rerun Suite2p even if suite2p\plane0\stat.npy exists
+  chan2_threshold: 0.65    # red label threshold of the run (intensity ratio; 0.25 if RED_METHOD = blobs)
+  use_mc_bad_frames: true  # drop motion-correction bad frames from activity features
 
 # ---------- Imaging / genotype ----------
 um_per_px: 1.0             # SET THIS: size rules are in um
 cre_line: D1               # D1: red+ = dSPN. D2: red+ = iSPN (Drd2-Cre also labels CINs)
 
 # ---------- Features ----------
-feature_version: v1        # bump when features.py changes; caches are per version
 neuropil_coef: 0.7
 baseline_window_s: 60      # rolling-percentile window for F0
 baseline_percentile: 8
@@ -46,21 +39,34 @@ model_dir: 'C:\path\to\celltype_model'
 labeler: ''                # your initials, saved with every label
 
 hard_rules:
-  cin_min_diam_um: 20      # larger somata -> non-SPN (cholinergic interneurons)
+  cin_min_diam_um: 100  # larger soma might mean cholinergic interneurons but with zoomed in FOV, it's not reliable
   min_solidity: 0.80       # lower -> non-SPN (dendrites, merged ROIs)
   max_aspect: 2.5          # higher -> non-SPN
+  max_oob_frac: 0.1       # edge ROIs: MORE than this share of an ROI's pixels (a fraction: 0 = any pixel, 0.1 = more than 10 %)
+                           # outside the valid area of the green or red image (e.g. the cut-off edge of the red reference)
+                           # -> non-SPN (junk), never sent to the models
 
-model1: selftrain_logreg   # SPN vs non-SPN: selftrain_logreg | selftrain_hgb
-model2: labelspreading     # red+ vs red- among SPNs: labelspreading | logreg
+model1: ensemble           # SPN vs non-SPN: selftrain_logreg | selftrain_hgb | ensemble (mean of the two probabilities)
+model2: logreg             # red+ vs red- among SPNs: labelspreading | logreg
+regularization:            # strength of the penalty on the weights of the logistic regressions (C: smaller = stronger)
+  stage1_C: 1.0            # SPN vs non-SPN (used with model1: selftrain_logreg); 1.0 = scikit-learn's default
+  stage2_C: 1.0            # red+ vs red- (used with model2: logreg)
+  tune: true           # true: at every training pick C from C_grid by cross-validation that holds out whole
+                           # sessions (the strongest penalty within 0.002 AUC of the best); stage*_C are then ignored
+  C_grid: [0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
 min_labels_per_class: 20   # fewer non-SPN labels -> stage 1 falls back to an
                            # anomaly detector fit on SPN labels only
 anomaly_quantile: [0.01, 0.05]   # anomaly mode: non-SPN below 1st, uncertain below 5th
                                  # percentile of training-SPN scores
 
 thresholds:
-  p_spn_hi: 0.9            # SPN above, non-SPN below p_spn_lo, uncertain in between
-  p_spn_lo: 0.2
-  p_red_hi: 0.9            # red+ above, red- below p_red_lo, ambiguous in between
-  p_red_lo: 0.1
+  p_spn_hi: 0.75          # SPN above, non-SPN below p_spn_lo, uncertain in between
+  p_spn_lo: 0.25
+  p_red_hi: 0.7           # red+ above, red- below p_red_lo, ambiguous in between
+  p_red_lo: 0.3
 
-use_iscell: true           # ROIs with Suite2p iscell == 0 are labeled not_cell
+edge_margin_px: 2         # also count this many pixels around an ROI when checking the image edges (0 = the ROI only)
+model_id: null              # null = the latest model (the newest id in model_dir); e.g. '20261021-1432' pins that model
+use_iscell: true           # ROIs with iscell == 0 are labeled not_cell
+iscell_prob_min: 0.3    # which ROIs count as cells (and so go into training / prediction):
+                           #   null = Suite2p's own binary iscell; a number (e.g. 0.3) = iscell probability >= number

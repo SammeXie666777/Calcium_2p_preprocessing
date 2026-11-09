@@ -1,0 +1,79 @@
+function register_reference(refTif, mcPath, regrefPath)
+% REGISTER_REFERENCE  Rigidly register the reference (structural channel) mean
+% image to the session mean image; the channels differ, so a multimodal metric
+% is used.
+%
+%   register_reference(refTif, mcPath, regrefPath)
+%   refTif      motion-corrected reference tif ('' = no reference: skipped)
+%   mcPath      ConcatenatedMovie_MC.tif of the session
+%   regrefPath  output: registered reference tif; the session mean / max
+%               images, all_registeration_imgs.mat and merged_channel.tif
+%               (green = session, red = reference) go in the session folder
+if isempty(refTif)
+    fprintf('  ! no reference for this session; skipping registration\n');
+    return
+end
+shiftsOf = @(t) regexprep(t, '\.tif$', '_shifts.mat');
+if ~isfile(shiftsOf(refTif)) || ~isfile(shiftsOf(mcPath))
+    fprintf('  ! reference or session motion correction missing; skipping registration\n');
+    return
+end
+sessDir = fileparts(mcPath);
+R = load(shiftsOf(refTif), 'meanImg');
+S = load(shiftsOf(mcPath), 'meanImg', 'maxImg');
+avgRef = double(R.meanImg);
+avgMc = double(S.meanImg);
+maxMc = double(S.maxImg);
+[optimizer, metric] = imregconfig('multimodal');
+
+% start from the translation implied by the two output rectangles (raw px):
+% reference pixel (r, c) is session pixel (r + dy, c + dx); zero if equal
+refOut = read_crop_out(refTif);
+sessOut = read_crop_out(mcPath);
+init = [];
+if numel(refOut) == 4 && numel(sessOut) == 4
+    d = refOut(1:2) - sessOut(1:2);
+    if isequal(refOut, sessOut)
+        fprintf('  reference and session cover the same pixels (%d x %d)\n', size(avgMc));
+    else
+        fprintf('  reference is offset by [dy dx] = [%d %d] px from the session\n', d(1), d(2));
+    end
+    try
+        init = rigid2d(0, [d(2) d(1)]);              % R2022b+
+    catch
+        init = affine2d([1 0 0; 0 1 0; d(2) d(1) 1]);
+    end
+else
+    fprintf('  ! no crop info in the shifts files: registering from image content only\n');
+end
+registered = [];
+if ~isempty(init)
+    try
+        registered = imregister(avgRef, avgMc, 'rigid', optimizer, metric, 'InitialTransformation', init);
+    catch ME
+        fprintf('  ! registration with the crop-based start failed (%s); retrying without\n', ME.message);
+    end
+end
+if isempty(registered)
+    registered = imregister(avgRef, avgMc, 'rigid', optimizer, metric);
+end
+
+writeTif16(regrefPath, registered);
+writeTif16(fullfile(sessDir, 'ConcatenatedMovie_MC_avg_registered.tif'), avgMc);
+writeTif16(fullfile(sessDir, 'ConcatenatedMovie_MC_max_registered.tif'), maxMc);
+avg_mcvid = avgMc; avg_refvid = avgRef; max_mcvid = maxMc;    % names kept for later steps
+save(fullfile(sessDir, 'all_registeration_imgs.mat'), 'registered', 'avg_mcvid', 'avg_refvid', 'max_mcvid');
+merged = imfuse(avgMc, registered, 'falsecolor', 'Scaling', 'joint', 'ColorChannels', [2 1 0]);
+imwrite(merged, fullfile(sessDir, 'merged_channel.tif'));
+end
+
+function writeTif16(path, img)
+t = Tiff(path, 'w');
+c = onCleanup(@() t.close());
+t.setTag(struct('ImageLength', size(img, 1), 'ImageWidth', size(img, 2), ...
+    'Photometric', Tiff.Photometric.MinIsBlack, 'BitsPerSample', 16, ...
+    'SamplesPerPixel', 1, 'SampleFormat', Tiff.SampleFormat.UInt, ...
+    'PlanarConfiguration', Tiff.PlanarConfiguration.Chunky, ...
+    'Compression', Tiff.Compression.None));
+t.write(uint16(img));
+end

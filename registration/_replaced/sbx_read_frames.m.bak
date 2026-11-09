@@ -1,0 +1,110 @@
+function Y = sbx_read_frames(sbxPath, frames, varargin)
+% SBX_READ_FRAMES  Read frames of one PMT channel straight from a Scanbox
+% .sbx file (no tif conversion).
+%
+%   Y = sbx_read_frames(sbxPath, frames)
+%   Y = sbx_read_frames(sbxPath, frames, 'channel', 1, 'crop', [1 80 Inf Inf], ...
+%                       'bidi', [0 0], 'info', [])
+%
+%   sbxPath  .sbx file (extension optional)
+%   frames   0-based frame numbers on disk (vector, any order, repeats ok)
+%   channel  PMT channel (1 = green, 2 = red)
+%   crop     [row1 col1 row2 col2] raw-frame crop (Inf = frame edge), the
+%            same convention as sbx_motion_correct
+%   bidi     [shiftOdd shiftEven] px: column shift of the odd / even raw rows
+%            applied before cropping (sbx_motion_correct's out.bidi.applied);
+%            [0 0] = raw frames
+%   info     sbx_file_info(sbxPath) if already available (saves a .mat load)
+%
+%   Y        uint16 [rows cols numel(frames)], in the order of 'frames'
+%            (same value convention as sbxread: the stored data is inverted).
+
+% plain name-value parsing (no inputParser: this also runs on thread workers)
+o = struct('channel', 1, 'crop', [1 80 Inf Inf], 'bidi', [0 0], 'info', []);
+for k = 1:2:numel(varargin)
+    if ~isfield(o, varargin{k})
+        error('sbx_read_frames: unknown option ''%s''.', varargin{k});
+    end
+    o.(varargin{k}) = varargin{k+1};
+end
+info = o.info;
+if isempty(info)
+    info = sbx_file_info(sbxPath);
+end
+crop = double(o.crop(:)');
+rc = [max(crop(1:2), 1), min(crop(3:4), [info.rows info.cols])];
+ci = find(info.chs == o.channel);
+if isempty(ci)
+    error('%s: channel %d not recorded (channels: %s)', info.path, o.channel, mat2str(info.chs));
+end
+frames = double(frames(:)');
+if any(frames < 0 | frames >= info.nFramesDisk | frames ~= round(frames))
+    error('%s: frame numbers must be integers in [0, %d].', info.path, info.nFramesDisk - 1);
+end
+[fs, ord] = sort(frames);
+n = numel(fs);
+Y = zeros(rc(3)-rc(1)+1, rc(4)-rc(2)+1, n, 'uint16');
+if n == 0
+    return
+end
+fid = fopen(info.path, 'r');
+closeFile = onCleanup(@() fclose(fid));
+maxRun = 200;                                     % frames per fread
+brk = [0, find(diff(fs) ~= 1), n];                % contiguous runs
+pos = 0;
+for r = 1:numel(brk)-1
+    for s0 = brk(r):maxRun:brk(r+1)-1
+        m = min(maxRun, brk(r+1) - s0);
+        fseek(fid, fs(s0+1) * info.frameBytes, 'bof');
+        x = fread(fid, info.frameBytes / 2 * m, 'uint16=>uint16');
+        if numel(x) ~= info.frameBytes / 2 * m
+            error('Short read in %s at frame %d', info.path, fs(s0+1));
+        end
+        % on disk: [chan col row frame], values inverted (as in sbxread)
+        x = permute(reshape(x, info.nchan, info.cols, info.rows, m), [3 2 4 1]);
+        if any(o.bidi ~= 0)
+            c1 = max(rc(2) - 3, 1);
+            c2 = min(rc(4) + 3, info.cols);
+            z = single(intmax('uint16') - x(:, c1:c2, :, ci));
+            z(1:2:end, :, :) = shiftCols(z(1:2:end, :, :), o.bidi(1));
+            z(2:2:end, :, :) = shiftCols(z(2:2:end, :, :), o.bidi(2));
+            Y(:, :, pos+(1:m)) = uint16(z(rc(1):rc(3), rc(2)-c1+1:rc(4)-c1+1, :));
+        else
+            Y(:, :, pos+(1:m)) = intmax('uint16') - x(rc(1):rc(3), rc(2):rc(4), :, ci);
+        end
+        pos = pos + m;
+    end
+end
+Y(:, :, ord) = Y;                                 % back to the requested order
+end
+
+function Y = shiftCols(Y, s)
+% Move the content of every row by s columns (+ = right): out(:,c) = in(:,c-s);
+% Lanczos-3 interpolation, edge pixels replicated (same as sbx_motion_correct).
+if s == 0
+    return
+end
+nC = size(Y, 2);
+k = floor(s);
+f = s - k;
+j = -2:3;
+w = lanczos3(j - f);
+w = w / sum(w);
+cols = 1:nC;
+Z = zeros(size(Y), 'like', Y);
+for t = 1:numel(j)
+    if w(t) == 0
+        continue
+    end
+    Z = Z + w(t) * Y(:, min(max(cols - k - j(t), 1), nC), :);
+end
+Y = Z;
+end
+
+function w = lanczos3(d)
+w = zeros(size(d));
+m = abs(d) < 3 & d ~= 0;
+dm = d(m);
+w(m) = 3 * sin(pi*dm) .* sin(pi*dm/3) ./ (pi^2 * dm.^2);
+w(d == 0) = 1;
+end

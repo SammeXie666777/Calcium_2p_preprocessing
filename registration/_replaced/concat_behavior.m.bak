@@ -1,0 +1,61 @@
+function cb = concat_behavior(movies, nUsed, match)
+% CONCAT_BEHAVIOR  Stack the per-frame behavior of the split movies of one
+% session, aligned to the frames kept by sbx_motion_correct.
+%
+%   cb = concat_behavior(movies, nUsed, match)
+%   movies  cell of split behavior .mat files, one per sbx segment
+%   nUsed   imaging frames kept per segment (sbx frames - 1)
+%   match   struct array, one element per segment (copied to cb.segmentInfo)
+%
+% Per segment the first frame is dropped and the values are trimmed or padded
+% (with the last value) to nUsed. Added fields: segment, frameInSbx
+% (0-based frame in the .sbx), segmentInfo, and ignoreTrialActual (first and
+% last virmen trial of each segment, which are incomplete).
+nSeg = numel(movies);
+segs = cellfun(@load, movies, 'UniformOutput', false);
+isPerFrame = @(B, f) (isnumeric(B.(f)) || islogical(B.(f))) && isvector(B.(f)) ...
+    && numel(B.(f)) == numel(B.timestamp);
+pf = cellfun(@(B) fieldnames(B)', segs, 'UniformOutput', false);
+pf = cellfun(@(B, fn) fn(cellfun(@(f) isPerFrame(B, f), fn)), segs, pf, 'UniformOutput', false);
+allPF = unique([pf{:}], 'stable');
+
+cb = struct();                           % not per-frame: first segment's copy
+for f = setdiff(fieldnames(segs{1})', [allPF, {'check_ttl_spacing'}], 'stable')
+    cb.(f{1}) = segs{1}.(f{1});
+end
+for f = allPF                            % per-frame: drop first, trim / pad, stack
+    parts = cell(nSeg, 1);
+    for s = 1:nSeg
+        v = [];
+        if ismember(f{1}, pf{s})
+            v = double(segs{s}.(f{1})(2:end));
+        end
+        if isempty(v)
+            parts{s} = nan(nUsed(s), 1);
+        else
+            parts{s} = reshape(v(min(1:nUsed(s), numel(v))), [], 1);
+        end
+    end
+    cb.(f{1}) = vertcat(parts{:});
+end
+
+cb.segment = reshape(repelem((1:nSeg)', nUsed(:)), [], 1);
+cb.frameInSbx = cell2mat(arrayfun(@(n) (1:n)', nUsed(:), 'UniformOutput', false));
+ttl = cell(1, nSeg);
+for s = 1:nSeg
+    ttl{s} = [];
+    if isfield(segs{s}, 'check_ttl_spacing'), ttl{s} = segs{s}.check_ttl_spacing; end
+end
+[match.check_ttl_spacing] = ttl{:};
+cb.segmentInfo = match;
+if isfield(cb, 'virmen_trial')
+    ign = [];
+    for s = 1:nSeg
+        v = cb.virmen_trial(cb.segment == s & ~isnan(cb.virmen_trial));
+        if ~isempty(v)
+            ign = [ign, v(1), v(end)]; %#ok<AGROW>
+        end
+    end
+    cb.ignoreTrialActual = unique(ign);
+end
+end

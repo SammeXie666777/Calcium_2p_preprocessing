@@ -1,0 +1,58 @@
+function plot_reference_registration(refTif, mcPath, outPng, name)
+% PLOT_REFERENCE_REGISTRATION  Figure of the reference-to-session registration
+% (output of register_reference): the two images, their overlay, a
+% checkerboard, the reference before registration, the residual
+% misalignment between them, and the crop rectangles.
+%
+%   plot_reference_registration(refTif, mcPath, outPng, name)
+sessDir = fileparts(mcPath);
+R = load(fullfile(sessDir, 'all_registeration_imgs.mat'), 'registered', 'avg_mcvid', 'avg_refvid');
+green = double(R.avg_mcvid);
+red = double(R.registered);
+lim = @(x) interp1(linspace(0, 100, numel(x)), sort(x(:)), [1 99.7]);
+norm01 = @(x, l) min(max((x - l(1)) / max(l(2) - l(1), eps), 0), 1);
+g = norm01(green, lim(green));
+r = norm01(red, lim(red));
+
+% residual: phase correlation of gradient-magnitude images (two modalities)
+ed = @(x) imgradient(imgaussfilt(x, 1));
+[dy, dx, pk] = phase_shift_img(ed(g), ed(r));
+ov = (red > 0) & (green > 0);
+ncc = corr(g(ov), r(ov));
+[yy, xx] = ndgrid(1:size(g, 1), 1:size(g, 2));
+tile = mod(floor((yy - 1) / 64) + floor((xx - 1) / 64), 2) == 0;
+cb = g .* tile + r .* ~tile;
+refCrop = read_crop_out(refTif);
+sessCrop = read_crop_out(mcPath);
+
+f = figure('Visible', 'off', 'Color', 'w', 'Position', [50 50 1500 900]);
+tl = tiledlayout(2, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
+nexttile; imagesc(g); axis image off; colormap(gca, gray);
+title({'session mean image (functional channel)', 'motion-corrected movie'});
+nexttile; imagesc(r); axis image off; colormap(gca, gray);
+title({'reference (structural channel), registered', 'rigid, into the session frame'});
+nexttile; image(cat(3, r, g, zeros(size(g)))); axis image off;
+title({'overlay: session = green, reference = red', 'yellow = aligned; single colour = mismatch'});
+nexttile; imagesc(cb); axis image off; colormap(gca, gray);
+title({'checkerboard (64 px tiles): session / reference', 'structures should continue across tile borders'});
+nexttile; imagesc(double(R.avg_refvid)); axis image off; colormap(gca, gray);
+title({'reference mean image BEFORE registration', 'native crop of its own motion correction'});
+nexttile; axis off
+if isequal(refCrop, sessCrop), same = '   -> same raw pixels'; else, same = '   -> different pixels (offset used as start)'; end
+txt = {sprintf('residual shift (edge phase correlation): dy %+.2f, dx %+.2f px', dy, dx), ...
+    sprintf('   correlation peak %.2f (low = unreliable)', pk), ...
+    sprintf('intensity correlation in the overlap (NCC): %.2f', ncc), '', ...
+    sprintf('reference crop.out [r1 c1 r2 c2]: %s', num2str(refCrop)), ...
+    sprintf('session   crop.out [r1 c1 r2 c2]: %s', num2str(sessCrop)), same, '', ...
+    sprintf('session image %d x %d px; reference %d x %d px', size(green), size(R.avg_refvid))};
+text(0, 1, txt, 'VerticalAlignment', 'top', 'FontSize', 11, 'Interpreter', 'none');
+title(tl, sprintf('%s - registration of the reference to the session (rigid)', strrep(name, '_', '\_')), ...
+    'FontWeight', 'bold');
+if ~isfolder(fileparts(outPng)), mkdir(fileparts(outPng)); end
+try
+    exportgraphics(f, outPng, 'Resolution', 150);
+catch
+    saveas(f, outPng);
+end
+close(f);
+end
